@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.40.0",
+    "@anthropic-ai/sdk": "^0.96.0",
     "@googlemaps/js-api-loader": "^1.16.8",
     "cheerio": "^1.0.0",
     "next": "14.2.35",
