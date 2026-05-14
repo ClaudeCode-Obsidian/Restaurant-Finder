@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body { @apply h-full; }
+  body { @apply bg-white text-gray-900 antialiased; }
+}
+
+/* Subtle shimmer for loading states */
+@keyframes shimmer {
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, #f3f4f6 0px, #e5e7eb 200px, #f3f4f6 400px);
+  background-size: 800px;
+  animation: shimmer 1.5s infinite linear;
+}
