@@ -15,7 +15,7 @@ import { searchPlaces } from '@/lib/googlePlaces';
 import { fetchPriceTier } from '@/lib/openrice';
 import { fetchAvailability } from '@/lib/availability';
 import { describeRestaurant } from '@/lib/claude';
-import { PRICE_LABELS, type Restaurant } from '@/lib/types';
+import { PRICE_LABELS, type PriceTier, type Restaurant } from '@/lib/types';
 
 export const runtime = 'nodejs'; // need Node APIs for cheerio/scraping
 export const dynamic = 'force-dynamic'; // results vary per query — don't cache the route itself
@@ -38,7 +38,8 @@ export async function GET(req: NextRequest) {
   const enriched = await Promise.all(
     places.map(async (p): Promise<Restaurant> => {
       const name = p.name ?? 'Unknown';
-      const [priceTier, blurb, availability] = await Promise.all([
+      const googleTier = p.priceTier ?? 0;
+      const [openRiceTier, describe, availability] = await Promise.all([
         fetchPriceTier(name),
         describeRestaurant({
           name,
@@ -56,6 +57,17 @@ export async function GET(req: NextRequest) {
           location: p.location ?? { lat: 0, lng: 0 },
         }),
       ]);
+      const blurb = describe.description;
+      // Four-tier fallback for price (each step kicks in only if prior was 0):
+      //   1. OpenRice (most precise HKD — usually 0 because of their bot challenge)
+      //   2. Google priceLevel (sparse in HK — chains only)
+      //   3. Claude's estimate from cuisine + rating + name
+      //   4. Cuisine-aware hardcoded default — guarantees we never show N/A
+      const priceTier =
+        openRiceTier > 0 ? openRiceTier
+        : googleTier > 0 ? googleTier
+        : describe.estimatedPriceTier > 0 ? describe.estimatedPriceTier
+        : defaultTierFromCuisine(p.cuisine, p.rating ?? 0);
       const priceLabel = PRICE_LABELS[priceTier];
       return {
         placeId: p.placeId!,
@@ -80,6 +92,23 @@ export async function GET(req: NextRequest) {
   );
 
   return NextResponse.json({ restaurants: enriched, dateTime, partySize, q });
+}
+
+/**
+ * Last-resort price tier from cuisine + rating, in HK context.
+ * Rules are intentionally conservative — when uncertain, we land on tier 3
+ * ($101–200), which is the median HK dinner price.
+ */
+function defaultTierFromCuisine(cuisine: string | undefined, rating: number): PriceTier {
+  const c = (cuisine ?? '').toLowerCase();
+  // Fast-food / cafe / cha chaan teng / noodles
+  if (/(fast.?food|noodle|cha.?chaan|cafe|coffee|bakery|tea)/.test(c)) return 1;
+  // Fine dining / omakase / Michelin / kaiseki
+  if (/(fine.?dining|omakase|kaiseki|michelin)/.test(c)) return 5;
+  // Cuisine known but generic — bump by rating: 4.7+ likely upscale
+  if (c) return rating >= 4.7 ? 4 : 3;
+  // No cuisine info at all — pick the HK median
+  return 3;
 }
 
 /**

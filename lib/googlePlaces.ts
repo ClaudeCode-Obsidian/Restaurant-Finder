@@ -8,7 +8,22 @@
  * Required env: GOOGLE_MAPS_API_KEY (server-side only — never expose this one).
  */
 
-import type { Restaurant } from './types';
+import type { PriceTier, Restaurant } from './types';
+
+/**
+ * Map Google Places `priceLevel` enum to our 0–6 PriceTier (OpenRice scale).
+ * Google has 4 meaningful restaurant tiers; we spread them across 0/2/3/4/6
+ * so the labels still feel HK-priced.
+ */
+function priceTierFromGoogle(level: string | undefined): PriceTier {
+  switch (level) {
+    case 'PRICE_LEVEL_INEXPENSIVE': return 2; // ~$51–100
+    case 'PRICE_LEVEL_MODERATE':    return 3; // ~$101–200
+    case 'PRICE_LEVEL_EXPENSIVE':   return 4; // ~$201–400
+    case 'PRICE_LEVEL_VERY_EXPENSIVE': return 6; // Over $801
+    default: return 0;
+  }
+}
 
 const BASE = 'https://places.googleapis.com/v1';
 // Field mask — Google requires explicitly listing fields you want.
@@ -110,6 +125,7 @@ function normalize(p: RawPlace): Partial<Restaurant> {
     openingHours: p.regularOpeningHours?.weekdayDescriptions,
     openNow: p.currentOpeningHours?.openNow,
     description: p.editorialSummary?.text ?? '',
+    priceTier: priceTierFromGoogle(p.priceLevel),
     websiteUrl: p.websiteUri,
     cuisine: p.primaryTypeDisplayName?.text,
     photoUrl: p.photos?.[0]

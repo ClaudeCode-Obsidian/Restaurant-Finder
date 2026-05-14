@@ -9,7 +9,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import type { Restaurant, SearchQuery } from './types';
+import type { PriceTier, Restaurant, SearchQuery } from './types';
 
 const MODEL = 'claude-haiku-4-5-20251001';
 // Haiku 4.5: fast, cheap, and plenty smart for parsing + short summaries.
@@ -90,35 +90,70 @@ export interface DescribeInput {
   editorial?: string; // Google's own "editorialSummary" if present
 }
 
+export interface DescribeResult {
+  description: string;
+  /**
+   * Best-effort estimate of HK price tier (OpenRice scale 0–6) based on the
+   * restaurant's name, cuisine, rating, and any editorial summary. 0 = unsure.
+   * Used as fallback when OpenRice scraping and Google's priceLevel both fail.
+   */
+  estimatedPriceTier: PriceTier;
+}
+
 /**
- * Generate the 3-part description: formality, ambience, specialties.
- * We pass whatever Google gives us (rating, price tier, primary type) as
- * grounding so Claude doesn't hallucinate. If data is thin, the output is
- * conservative ("a [cuisine] restaurant in [area]") rather than invented.
+ * Generate the 3-part description (formality, ambience, specialties) AND a
+ * best-effort price-tier estimate, in a single Claude call.
+ *
+ * Bundling means we only pay for one round-trip per restaurant. The model is
+ * asked to ground both outputs in the inputs and to return 0 for price when
+ * it has no signal — never to invent a number.
  */
-export async function describeRestaurant(input: DescribeInput): Promise<string> {
+export async function describeRestaurant(input: DescribeInput): Promise<DescribeResult> {
   try {
     const msg = await client().messages.create({
       model: MODEL,
-      max_tokens: 180,
+      max_tokens: 260,
       system:
-        'You write concise restaurant blurbs. EXACTLY one paragraph, ' +
-        '2–3 short sentences total, covering in order: ' +
-        '(1) formality — pick one of: casual / upscale / fine dining, ' +
+        'You write concise restaurant blurbs AND estimate HK price tiers. ' +
+        'Return ONLY a JSON object — no prose, no markdown fences — with keys:\n' +
+        '  description (string): EXACTLY one paragraph, 2–3 short sentences, in order: ' +
+        '(1) formality (casual / upscale / fine dining), ' +
         '(2) ambience & decor in 4–8 words, ' +
         '(3) signature specialties or dish category. ' +
-        'Use only the grounding provided. If unsure, stay general. ' +
-        'Do not invent specific dish names you were not given.',
-      messages: [
-        {
-          role: 'user',
-          content: JSON.stringify(input),
-        },
-      ],
+        'Use ONLY the grounding provided; do not invent dish names.\n' +
+        '  estimatedPriceTier (integer 1–6, NOT 0): typical dinner price per person in HKD. ' +
+        '1=Under $50, 2=$51-100, 3=$101-200, 4=$201-400, 5=$401-800, 6=Over $801. ' +
+        'Algorithm: ' +
+        '(a) If you recognize the specific restaurant, use that knowledge. ' +
+        '(b) Else default by cuisine in HK: ' +
+        'fast-food/noodle shop = 1; cha chaan teng / casual local = 2; ' +
+        'mid-range Japanese / Italian / Western = 3; upscale Japanese / steakhouse = 4; ' +
+        'fine dining / omakase / Michelin = 5–6. ' +
+        '(c) Adjust UP one tier if rating > 4.7 (likely upscale niche). ' +
+        '(d) Adjust UP one tier if name suggests omakase, kaiseki, Michelin, or chef-led. ' +
+        'You MUST output 1–6; never 0. When uncertain, pick the cuisine default in (b).',
+      messages: [{ role: 'user', content: JSON.stringify(input) }],
     });
-    return textOf(msg).trim() || fallbackBlurb(input);
+    const raw = textOf(msg).trim();
+    return safeParseDescribe(raw, input);
   } catch {
-    return fallbackBlurb(input);
+    return { description: fallbackBlurb(input), estimatedPriceTier: 0 };
+  }
+}
+
+function safeParseDescribe(raw: string, input: DescribeInput): DescribeResult {
+  try {
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const obj = JSON.parse(cleaned) as Partial<DescribeResult>;
+    const tier = Number(obj.estimatedPriceTier);
+    return {
+      description: typeof obj.description === 'string' && obj.description
+        ? obj.description
+        : fallbackBlurb(input),
+      estimatedPriceTier: tier >= 0 && tier <= 6 ? (tier as PriceTier) : 0,
+    };
+  } catch {
+    return { description: fallbackBlurb(input), estimatedPriceTier: 0 };
   }
 }
 
