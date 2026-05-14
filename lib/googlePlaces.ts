@@ -25,7 +25,7 @@ const SEARCH_FIELDS = [
   'places.regularOpeningHours',
   'places.currentOpeningHours.openNow',
   'places.editorialSummary',
-  'places.websiteUrl',
+  'places.websiteUri',
   'places.reservable',
   'places.googleMapsUri',
   'places.photos',
@@ -52,7 +52,7 @@ interface RawPlace {
   regularOpeningHours?: { weekdayDescriptions?: string[] };
   currentOpeningHours?: { openNow?: boolean };
   editorialSummary?: { text: string };
-  websiteUrl?: string;
+  websiteUri?: string;
   googleMapsUri?: string;
   photos?: Array<{ name: string }>;
   primaryTypeDisplayName?: { text: string };
@@ -110,7 +110,7 @@ function normalize(p: RawPlace): Partial<Restaurant> {
     openingHours: p.regularOpeningHours?.weekdayDescriptions,
     openNow: p.currentOpeningHours?.openNow,
     description: p.editorialSummary?.text ?? '',
-    websiteUrl: p.websiteUrl,
+    websiteUrl: p.websiteUri,
     cuisine: p.primaryTypeDisplayName?.text,
     photoUrl: p.photos?.[0]
       ? photoUrl(p.photos[0].name, 800)
