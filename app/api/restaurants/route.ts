@@ -2,9 +2,10 @@
  * GET /api/restaurants?q=...&dateTime=...&partySize=...
  *
  * The fan-out endpoint. For each Google Places result we kick off, IN PARALLEL:
- *   - OpenRice price tier lookup
+ *   - Google Maps price-tier scrape (one Playwright visit, shared with the
+ *     Reserve URL discovery via fetchMapsData promise-cache)
  *   - Claude-generated description
- *   - Availability lookup (best-effort)
+ *   - Availability lookup
  *
  * We use Promise.all so all three run concurrently per restaurant. Sequential
  * would be O(N × 3) round-trips; parallel is O(N) which keeps the page snappy.
@@ -12,7 +13,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { searchPlaces } from '@/lib/googlePlaces';
-import { fetchPriceTier } from '@/lib/openrice';
+import { fetchGoogleMapsPrice } from '@/lib/google-reserve';
 import { fetchAvailability } from '@/lib/availability';
 import { describeRestaurant } from '@/lib/claude';
 import { PRICE_LABELS, type PriceTier, type Restaurant } from '@/lib/types';
@@ -38,9 +39,12 @@ export async function GET(req: NextRequest) {
   const enriched = await Promise.all(
     places.map(async (p): Promise<Restaurant> => {
       const name = p.name ?? 'Unknown';
-      const googleTier = p.priceTier ?? 0;
-      const [openRiceTier, describe, availability] = await Promise.all([
-        fetchPriceTier(name),
+      const googlePlacesTier = p.priceTier ?? 0;
+      // fetchGoogleMapsPrice + fetchAvailability *share* a Maps page visit
+      // via promise-cache in lib/google-reserve.ts — only one Playwright
+      // navigation happens per restaurant even though we kick off both here.
+      const [mapsPriceTier, describe, availability] = await Promise.all([
+        fetchGoogleMapsPrice(p.placeId!),
         describeRestaurant({
           name,
           rating: p.rating ?? 0,
@@ -61,13 +65,14 @@ export async function GET(req: NextRequest) {
       ]);
       const blurb = describe.description;
       // Four-tier fallback for price (each step kicks in only if prior was 0):
-      //   1. OpenRice (most precise HKD — usually 0 because of their bot challenge)
-      //   2. Google priceLevel (sparse in HK — chains only)
-      //   3. Claude's estimate from cuisine + rating + name
-      //   4. Cuisine-aware hardcoded default — guarantees we never show N/A
+      //   1. Google Maps price-range histogram — accurate HKD ranges, free
+      //      from the same Playwright visit we use for the Reserve URL.
+      //   2. Google Places `priceLevel` enum — sparse in HK (chains only).
+      //   3. Claude's estimate from cuisine + rating + name.
+      //   4. Cuisine-aware hardcoded default — guarantees we never show N/A.
       const priceTier =
-        openRiceTier > 0 ? openRiceTier
-        : googleTier > 0 ? googleTier
+        mapsPriceTier > 0 ? mapsPriceTier
+        : googlePlacesTier > 0 ? googlePlacesTier
         : describe.estimatedPriceTier > 0 ? describe.estimatedPriceTier
         : defaultTierFromCuisine(p.cuisine, p.rating ?? 0);
       const priceLabel = PRICE_LABELS[priceTier];

@@ -35,17 +35,24 @@
 
 import type { BrowserContext, Page } from 'playwright';
 import { acquire, getBrowser, newGoogleContext, release } from './playwright-pool';
-import type { TimeSlot } from './types';
+import type { PriceTier, TimeSlot } from './types';
 
 const PAGE_TIMEOUT_MS = 25_000;
 const POST_NAV_MS = 4000;         // wait for Reserve widget to hydrate
 const POST_CLICK_MS = 1500;       // wait after each picker interaction
 const SLOT_WINDOW_MIN = 60;       // ±60 minutes around requested time
 
-/* ─────────── Booking URL cache ─────────── */
+/* ─────────── Maps-data cache (booking URL + price tier) ─────────── */
 
-const _bookingUrlCache = new Map<string, string | null>();
-//                                      ^ null means "we looked, no Reserve link"
+interface MapsData {
+  bookingUrl: string | null;
+  /** 0 = unknown; 1–6 mapped from Google Maps price range. */
+  priceTier: PriceTier;
+}
+
+// We cache PROMISES (not values) so concurrent callers for the same
+// placeId share one Playwright fetch instead of racing two.
+const _mapsDataCache = new Map<string, Promise<MapsData>>();
 
 /* ─────────── Public API ─────────── */
 
@@ -56,6 +63,27 @@ export interface ReserveInput {
 }
 
 /**
+ * Read Google Maps for a placeId — single Playwright visit yields both
+ * the Reserve booking URL and the price-range tier. Cached by placeId.
+ *
+ * Used by:
+ *   - /api/restaurants price column (replaces the OpenRice scrape, which
+ *     was both slow and bot-blocked)
+ *   - fetchReserveSlots (below), which consumes the bookingUrl
+ */
+export function fetchMapsData(placeId: string): Promise<MapsData> {
+  if (_mapsDataCache.has(placeId)) return _mapsDataCache.get(placeId)!;
+  const p = doFetchMapsData(placeId);
+  _mapsDataCache.set(placeId, p);
+  return p;
+}
+
+/** Sugar: returns just the price tier (0 if unknown). */
+export async function fetchGoogleMapsPrice(placeId: string): Promise<PriceTier> {
+  return (await fetchMapsData(placeId)).priceTier;
+}
+
+/**
  * Given a Google placeId + requested date/time, return a standardised
  * list of ±1-hour TimeSlots scraped from Google's Reserve flow with
  * the date picker driven to the user's requested day.
@@ -63,7 +91,7 @@ export interface ReserveInput {
  * (caller should fall back to placeholder slots).
  */
 export async function fetchReserveSlots(input: ReserveInput): Promise<TimeSlot[]> {
-  const bookingUrl = await getBookingUrl(input.placeId);
+  const { bookingUrl } = await fetchMapsData(input.placeId);
   if (!bookingUrl) return [];
 
   await acquire();
@@ -140,11 +168,18 @@ async function selectPartySize(page: Page, size: number): Promise<void> {
   }
 }
 
-/* ─────────── Step 1: discover the Reserve URL ─────────── */
+/* ─────────── Step 1: scrape the Maps place page (URL + price) ─────────── */
 
-async function getBookingUrl(placeId: string): Promise<string | null> {
-  if (_bookingUrlCache.has(placeId)) return _bookingUrlCache.get(placeId)!;
-
+/**
+ * Single Playwright visit to the Maps place page that pulls:
+ *   - The Reserve "table" anchor href (Google's universal booking URL)
+ *   - The price-range tier, read from the "Price range histogram" widget
+ *     (or its short summary like "$100–350" / "$500+ per person")
+ *
+ * Returns `{ bookingUrl: null, priceTier: 0 }` on any failure so callers
+ * can fall through to their next-best source.
+ */
+async function doFetchMapsData(placeId: string): Promise<MapsData> {
   await acquire();
   let ctx: BrowserContext | null = null;
   try {
@@ -153,31 +188,74 @@ async function getBookingUrl(placeId: string): Promise<string | null> {
     const page = await ctx.newPage();
     const url = `https://www.google.com/maps/place/?q=place_id:${placeId}`;
     await page.goto(url, { waitUntil: 'commit', timeout: PAGE_TIMEOUT_MS });
-    // Wait for the place panel to hydrate — only the JS-rendered DOM
-    // exposes the Reserve anchor.
     await page.waitForTimeout(5500);
 
-    const reserveHref = await page.evaluate(() => {
-      const anchors = document.querySelectorAll<HTMLAnchorElement>('a[href]');
-      for (const a of anchors) {
-        const href = a.href || '';
-        const text = (a.textContent || '').trim();
-        if (/\/maps\/reserve\/v\//.test(href) || /Reserve a table/i.test(text)) {
-          return href;
+    const scraped = await page.evaluate(() => {
+      // Booking URL
+      let reserveHref: string | null = null;
+      for (const a of document.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+        if (/\/maps\/reserve\/v\//.test(a.href || '')) {
+          reserveHref = a.href;
+          break;
         }
       }
-      return null;
+      // Price — prefer the histogram (full distribution); fall back to
+      // the inline summary text. We return the *text* of whichever we
+      // find; tier mapping happens in TS so it's testable.
+      let priceText: string | null = null;
+      const hist = document.querySelector('[aria-label*="Price range" i]');
+      if (hist) {
+        priceText = (hist.getAttribute('aria-label') || '') + ' ' + (hist.textContent || '');
+      } else {
+        const body = document.body.innerText;
+        const r =
+          body.match(/\$\d+\+\s*per person/i) ||
+          body.match(/\$\d+[–\-—]\$?\d+/) ||
+          body.match(/[·•]\s*\$\d+\+/);
+        if (r) priceText = r[0];
+      }
+      return { reserveHref, priceText };
     });
 
-    _bookingUrlCache.set(placeId, reserveHref);
-    return reserveHref;
+    return {
+      bookingUrl: scraped.reserveHref,
+      priceTier: priceTierFromText(scraped.priceText),
+    };
   } catch {
-    _bookingUrlCache.set(placeId, null);
-    return null;
+    return { bookingUrl: null, priceTier: 0 };
   } finally {
     if (ctx) await ctx.close().catch(() => undefined);
     release();
   }
+}
+
+/**
+ * Map a Google Maps price string to our 0–6 PriceTier (OpenRice scale).
+ *
+ * Recognised shapes:
+ *   "$100–350"             → tier from midpoint = $225 → 4
+ *   "$500+ per person"     → tier 5/6 by lower bound
+ *   "·$500+"               → tier 5/6
+ *   Histogram aria-label   → use the lowest dollar number as the floor
+ *
+ * Google appears to report HK prices in HKD for HK places, so the mapping
+ * follows the OpenRice $-ranges directly.
+ */
+function priceTierFromText(text: string | null): PriceTier {
+  if (!text) return 0;
+  // Pull all dollar numbers; first is the lower bound, last is upper.
+  const nums = [...text.matchAll(/\$(\d+)/g)].map((m) => parseInt(m[1], 10));
+  if (nums.length === 0) return 0;
+  const lo = Math.min(...nums);
+  const hi = Math.max(...nums);
+  const isOpenEnded = /\+/.test(text); // "$500+"
+  const point = isOpenEnded ? hi : Math.round((lo + hi) / 2);
+  if (point <= 50) return 1;
+  if (point <= 100) return 2;
+  if (point <= 200) return 3;
+  if (point <= 400) return 4;
+  if (point <= 800) return 5;
+  return 6;
 }
 
 /* ─────────── Step 2: parse time slots from HTML ─────────── */
