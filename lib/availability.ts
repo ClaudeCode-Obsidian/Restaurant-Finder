@@ -21,9 +21,14 @@
  * `TimeSlot[]` and register it in dispatch().
  */
 
+import { fetchReserveSlots } from './google-reserve';
 import type { TimeSlot } from './types';
 
 export interface AvailabilityInput {
+  /** Google Places place_id — used to look up the Google Reserve URL. */
+  placeId?: string;
+  /** Google's reservable flag; skip the expensive Reserve dance when false. */
+  reservable?: boolean;
   bookingUrl?: string;
   websiteUrl?: string;
   /** ISO 8601 user-requested date/time. */
@@ -38,9 +43,31 @@ const UA =
   '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 export async function fetchAvailability(input: AvailabilityInput): Promise<TimeSlot[]> {
+  // PRIMARY: Google Maps "Reserve a table" flow — works across platforms
+  // because Google proxies to whichever partner the restaurant uses.
+  // Skip the lookup when Google says the place isn't reservable (saves
+  // ~10s of Playwright work per restaurant). When `reservable` is
+  // unset / undefined we still try, because Google leaves it absent on
+  // many HK places that DO actually take bookings.
+  if (input.placeId && input.reservable !== false) {
+    const slots = await fetchReserveSlots({
+      placeId: input.placeId,
+      dateTime: input.dateTime,
+      partySize: input.partySize,
+    });
+    if (slots.length > 0) return slots;
+  }
+
+  // SECONDARY: platform-specific scrapers when we already have a known
+  // booking URL (rare today — Google Places doesn't surface it).
   const url = input.bookingUrl ?? input.websiteUrl;
-  if (!url) return placeholderSlots(input);
-  return dispatch(url, input);
+  if (url) {
+    const platformSlots = await dispatch(url, input).catch(() => [] as TimeSlot[]);
+    if (platformSlots.length > 0) return platformSlots;
+  }
+
+  // FALLBACK: placeholder slots that deep-link to whatever URL we know.
+  return placeholderSlots(input);
 }
 
 async function dispatch(url: string, input: AvailabilityInput): Promise<TimeSlot[]> {

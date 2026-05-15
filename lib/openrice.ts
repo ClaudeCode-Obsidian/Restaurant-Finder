@@ -24,55 +24,12 @@
  * @sparticuz/chromium + playwright-core, or run this on a long-lived host.
  */
 
-import { chromium, type Browser, type BrowserContext } from 'playwright';
+import type { BrowserContext } from 'playwright';
+import { acquire, getBrowser, release } from './playwright-pool';
 import type { PriceTier } from './types';
 
 const ENDPOINT = 'https://www.openrice.com/en/hongkong/restaurants';
-const MAX_CONCURRENT = 4;       // browser pages running at the same time
 const PAGE_TIMEOUT_MS = 20_000; // hard cap per page
-
-/* ─────────── Shared browser singleton ─────────── */
-
-let _browserPromise: Promise<Browser> | null = null;
-
-function getBrowser(): Promise<Browser> {
-  if (_browserPromise) return _browserPromise;
-  _browserPromise = chromium
-    .launch({
-      headless: true,
-      // The first flag prevents `navigator.webdriver === true`, which is
-      // the most common bot-detection signal.
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-dev-shm-usage',
-      ],
-    })
-    .catch((err) => {
-      _browserPromise = null; // allow retry next call
-      throw err;
-    });
-  return _browserPromise;
-}
-
-/* ─────────── Concurrency limiter ─────────── */
-
-let _active = 0;
-const _waiters: Array<() => void> = [];
-
-async function acquire(): Promise<void> {
-  if (_active < MAX_CONCURRENT) {
-    _active++;
-    return;
-  }
-  await new Promise<void>((resolve) => _waiters.push(resolve));
-  _active++;
-}
-
-function release(): void {
-  _active--;
-  const next = _waiters.shift();
-  if (next) next();
-}
 
 /* ─────────── Public API ─────────── */
 
@@ -234,25 +191,5 @@ function matchScore(card: string, needle: string): number {
   return i;
 }
 
-/* ─────────── Cleanup hook ─────────── */
-
-// Best-effort cleanup when the Node process exits — keeps stray
-// Chromium processes from lingering after `next dev` is killed.
-if (typeof process !== 'undefined' && !process.env.__OPENRICE_CLEANUP_REGISTERED__) {
-  process.env.__OPENRICE_CLEANUP_REGISTERED__ = '1';
-  const close = async () => {
-    if (_browserPromise) {
-      try {
-        const b = await _browserPromise;
-        await b.close();
-      } catch {
-        /* ignore */
-      }
-    }
-  };
-  process.on('exit', close);
-  process.on('SIGINT', () => {
-    void close();
-    process.exit(0);
-  });
-}
+// Note: browser cleanup is handled by lib/playwright-pool.ts — no need
+// to register a second hook here.

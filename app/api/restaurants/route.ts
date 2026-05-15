@@ -49,6 +49,8 @@ export async function GET(req: NextRequest) {
           editorial: p.description,
         }),
         fetchAvailability({
+          placeId: p.placeId,
+          reservable: p.reservable,
           bookingUrl: p.bookingUrl,
           websiteUrl: p.websiteUrl,
           dateTime,

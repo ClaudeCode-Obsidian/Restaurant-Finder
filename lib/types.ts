@@ -46,6 +46,8 @@ export interface Restaurant {
   cuisine?: string;
   /** Restaurant's own website (from Places). */
   websiteUrl?: string;
+  /** Google flags restaurant as reservable (signal for trying booking lookups). */
+  reservable?: boolean;
   /** Reservation platform URL (OpenTable, Inline, SevenRooms, etc.) if detected. */
   bookingUrl?: string;
   /** Up to ~5 time slots near the requested time. */

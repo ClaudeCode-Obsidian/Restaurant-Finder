@@ -68,6 +68,7 @@ interface RawPlace {
   currentOpeningHours?: { openNow?: boolean };
   editorialSummary?: { text: string };
   websiteUri?: string;
+  reservable?: boolean;
   googleMapsUri?: string;
   photos?: Array<{ name: string }>;
   primaryTypeDisplayName?: { text: string };
@@ -127,6 +128,7 @@ function normalize(p: RawPlace): Partial<Restaurant> {
     description: p.editorialSummary?.text ?? '',
     priceTier: priceTierFromGoogle(p.priceLevel),
     websiteUrl: p.websiteUri,
+    reservable: p.reservable,
     cuisine: p.primaryTypeDisplayName?.text,
     photoUrl: p.photos?.[0]
       ? photoUrl(p.photos[0].name, 800)
