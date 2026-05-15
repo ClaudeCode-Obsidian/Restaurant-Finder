@@ -202,16 +202,31 @@ async function doFetchMapsData(placeId: string): Promise<MapsData> {
       // Price — prefer the histogram (full distribution); fall back to
       // the inline summary text. We return the *text* of whichever we
       // find; tier mapping happens in TS so it's testable.
+      //
+      // Observed Google Maps shapes:
+      //   Histogram aria-label "Price range histogram"
+      //     + text       "$1–50$50–100$100–150"  (HKD ranges)
+      //                  "$400–450$450–500$500+" (capped at $500+ in HK)
+      //                  "$10–20$20–30$30–40"    (USD for US places)
+      //   Inline summary "$10–20"  "$100–350"
+      //   "Per person"   "$50–100 per person"  "$500+ per person"
+      //   Open-ended     "·$500+"
+      //   Word label     "Inexpensive"  "Moderate"  "Expensive"  "Very Expensive"
       let priceText: string | null = null;
       const hist = document.querySelector('[aria-label*="Price range" i]');
       if (hist) {
         priceText = (hist.getAttribute('aria-label') || '') + ' ' + (hist.textContent || '');
       } else {
         const body = document.body.innerText;
+        // Try numeric patterns first; fall back to word labels.
         const r =
-          body.match(/\$\d+\+\s*per person/i) ||
-          body.match(/\$\d+[–\-—]\$?\d+/) ||
-          body.match(/[·•]\s*\$\d+\+/);
+          body.match(/\$\d[\d,]*\+\s*per person/i) ||
+          body.match(/\$\d[\d,]*[–\-—]\$?\d[\d,]*\s*per person/i) ||
+          body.match(/\$\d[\d,]*[–\-—]\$?\d[\d,]*/) ||
+          body.match(/[·•]\s*\$\d[\d,]*\+/) ||
+          // Word label — must be surrounded by separators to avoid
+          // matching a review sentence like "the food is moderate".
+          body.match(/[·•]\s*(Very Expensive|Expensive|Moderate|Inexpensive)\b/);
         if (r) priceText = r[0];
       }
       return { reserveHref, priceText };
@@ -232,24 +247,64 @@ async function doFetchMapsData(placeId: string): Promise<MapsData> {
 /**
  * Map a Google Maps price string to our 0–6 PriceTier (OpenRice scale).
  *
- * Recognised shapes:
- *   "$100–350"             → tier from midpoint = $225 → 4
- *   "$500+ per person"     → tier 5/6 by lower bound
- *   "·$500+"               → tier 5/6
- *   Histogram aria-label   → use the lowest dollar number as the floor
+ * Every format Google Maps surfaces, with examples:
  *
- * Google appears to report HK prices in HKD for HK places, so the mapping
- * follows the OpenRice $-ranges directly.
+ *   Range w/ midpoint                    → tier from midpoint
+ *     "$50–100 per person"               → mid 75   → 2 ($51-100)
+ *     "$100–350"                         → mid 225  → 4 ($201-400)
+ *     histogram "$1–50$50–100$100–150"   → mid ≈75  → 2
+ *
+ *   Open-ended ("$N+") — we bias UP one tier vs the lower-bound rule
+ *   because Google caps HK histograms at $500+ so genuine tier-6
+ *   restaurants look identical to tier-5 ones in the raw bucket text.
+ *     "·$500+ per person"                → 5  (could be 6; we round up)
+ *     "·$100+ per person" (USD)          → 3
+ *
+ *   Word labels (rare; only when user-report data is thin)
+ *     "Inexpensive"  → 1
+ *     "Moderate"     → 3
+ *     "Expensive"    → 4
+ *     "Very Expensive" → 6
+ *
+ * Currency assumption: Google reports prices in the LOCAL currency for
+ * the place. For HK places that's HKD, which maps directly onto the
+ * OpenRice tier ladder. The few US/EU restaurants that show in HK
+ * queries (rare) will be undervalued — acceptable.
  */
 function priceTierFromText(text: string | null): PriceTier {
   if (!text) return 0;
-  // Pull all dollar numbers; first is the lower bound, last is upper.
-  const nums = [...text.matchAll(/\$(\d+)/g)].map((m) => parseInt(m[1], 10));
+
+  // Word labels first — use `\b` so "Inexpensive" doesn't also match
+  // "Expensive". Check more-specific ones first.
+  if (/\bvery expensive\b/i.test(text)) return 6;
+  if (/\binexpensive\b/i.test(text)) return 1;
+  if (/\bexpensive\b/i.test(text)) return 4;
+  if (/\bmoderate\b/i.test(text)) return 3;
+
+  // Strip commas inside numbers ("$1,500" → "$1500") so the int parse
+  // doesn't split a single price into two separate digits.
+  const clean = text.replace(/(\$\d{1,3}(?:,\d{3})+)/g, (m) => m.replace(/,/g, ''));
+
+  // Each dollar token may be a range "$50–100" or a single value "$500".
+  // We need BOTH ends of any range — Google's histogram texts are bucket
+  // boundaries like "$1–50$50–100", so the actual upper bound only
+  // appears AFTER the en-dash.
+  const matches = [...clean.matchAll(/\$(\d+)(?:[–\-—](\d+))?/g)];
+  const nums = matches.flatMap((m) =>
+    m[2] ? [parseInt(m[1], 10), parseInt(m[2], 10)] : [parseInt(m[1], 10)]
+  );
   if (nums.length === 0) return 0;
+
   const lo = Math.min(...nums);
   const hi = Math.max(...nums);
-  const isOpenEnded = /\+/.test(text); // "$500+"
-  const point = isOpenEnded ? hi : Math.round((lo + hi) / 2);
+  // "+" anywhere in the relevant range portion means an open upper bound.
+  const isOpenEnded = /\$\d[\d,]*\+/.test(clean);
+
+  // For open-ended values, treat the cap as the LOW edge of the next
+  // bucket up — Google's "$500+" really means "we don't know, could be
+  // way more". Closed ranges use the midpoint.
+  const point = isOpenEnded ? Math.max(hi, lo) * 1.25 : Math.round((lo + hi) / 2);
+
   if (point <= 50) return 1;
   if (point <= 100) return 2;
   if (point <= 200) return 3;
