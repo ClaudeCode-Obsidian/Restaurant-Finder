@@ -1,30 +1,37 @@
 /**
  * Google Maps booking-link discovery + time-slot scraping.
  *
- * FLOW per restaurant:
- *   1. Open https://www.google.com/maps/place/?q=place_id:<id> in headless
- *      Chromium, with consent cookies pre-set.
- *   2. Find the "Reserve a table" anchor. Its href points to a Google
- *      Reserve universal URL: /maps/reserve/v/dine/c/<token>
- *   3. Open that Reserve URL and let it render. The page hosts a Google
- *      booking widget which exposes time-slot pills as plain DOM buttons.
- *   4. Extract all visible HH:MM strings, filter to ±60 min around the
- *      user's requested time, return as standardised TimeSlot[].
+ * TWO-STAGE FLOW per restaurant:
+ *
+ *   Stage A — Booking URL discovery (Playwright):
+ *     Open https://www.google.com/maps/place/?q=place_id:<id> in headless
+ *     Chromium with consent cookies pre-set. Find the "Reserve a table"
+ *     anchor; its href is the Google Reserve universal URL
+ *     /maps/reserve/v/dine/c/<token>. Cached in memory by placeId so we
+ *     only pay this cost once per restaurant per process lifetime.
+ *
+ *   Stage B — Slot scraping (PLAIN HTTP — no Playwright):
+ *     The Reserve page is server-side rendered. The time-pill data lives
+ *     directly in the HTML as `data-bts="<unix_seconds>"` attributes
+ *     adjacent to the slot picker. A simple `fetch` with the same consent
+ *     cookies gets the full page; a regex pulls out the timestamps.
+ *
+ * Why two stages? Stage A still needs Playwright because the place page
+ * is a Maps SPA where the Reserve anchor only appears after JS execution.
+ * Stage B is plain HTML — bypassing Playwright there cuts ~10s/restaurant
+ * and avoids the concurrency timeouts we saw in earlier iterations.
  *
  * STANDARDISED OUTPUT
- * Every restaurant — regardless of which underlying platform (OpenTable,
- * Inline, SevenRooms, partner widget) Google routes to — produces:
- *
  *   { time: ISO-8601, available: true, bookingUrl: <google reserve url> }
+ * The `bookingUrl` deep-links into Google's flow which routes to whichever
+ * underlying platform (OpenTable / Inline / OpenRice / Diningcity) the
+ * restaurant uses.
  *
- * The `bookingUrl` deep-links into the Google flow; clicking it carries
- * the user through to the actual booking partner with our requested date
- * and party size already filled in.
- *
- * CACHE
- * Booking URLs barely change. We cache (placeId → reserveUrl) in memory
- * for the lifetime of the Node process so a second search for the same
- * restaurant skips the Maps lookup entirely.
+ * LIMITATION
+ *   The Reserve URL is opaque — `?date=…&time=…&size=…` params are ignored
+ *   by the server, which always returns slots centred on ~19:00 for 2
+ *   guests today. So this works best for dinner-time / today queries.
+ *   For other windows we still rely on placeholder slots.
  */
 
 import type { BrowserContext } from 'playwright';
@@ -32,8 +39,20 @@ import { acquire, getBrowser, newGoogleContext, release } from './playwright-poo
 import type { TimeSlot } from './types';
 
 const PAGE_TIMEOUT_MS = 20_000;
-const POST_LOAD_MS = 5500;        // hydration buffer per page
 const SLOT_WINDOW_MIN = 60;       // ±60 minutes around requested time
+
+const RESERVE_FETCH_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+  // Consent cookies — same values Playwright contexts use. CONSENT=YES
+  // skips Google's consent interstitial; SOCS is set after a user clicks
+  // "Accept all" once and persists their choices.
+  Cookie:
+    'CONSENT=YES+cb.20210328-17-p0.en+FX+917; ' +
+    'SOCS=CAESHAgBEhJnd3NfMjAyNDA3MDgtMF9SQzIaAmVuIAEaBgiAyJq1Bg',
+};
 
 /* ─────────── Booking URL cache ─────────── */
 
@@ -57,25 +76,18 @@ export interface ReserveInput {
 export async function fetchReserveSlots(input: ReserveInput): Promise<TimeSlot[]> {
   const bookingUrl = await getBookingUrl(input.placeId);
   if (!bookingUrl) return [];
-
-  await acquire();
-  let ctx: BrowserContext | null = null;
   try {
-    const browser = await getBrowser();
-    ctx = await newGoogleContext(browser);
-    const page = await ctx.newPage();
-    await page.goto(bookingUrl, { waitUntil: 'commit', timeout: PAGE_TIMEOUT_MS });
-    // The Reserve widget renders time pills under the date selector. If the
-    // restaurant uses an embedded partner widget (iframe), times may be a
-    // few seconds slower to appear.
-    await page.waitForTimeout(POST_LOAD_MS);
-    const text = await page.evaluate(() => document.body.innerText);
-    return parseSlots(text, input.dateTime, bookingUrl);
+    const res = await fetch(bookingUrl, {
+      headers: RESERVE_FETCH_HEADERS,
+      // Cache same restaurant for 5 min — slot data only updates as
+      // bookings come in.
+      next: { revalidate: 300 },
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+    return parseSlotsFromHtml(html, input.dateTime, bookingUrl);
   } catch {
     return [];
-  } finally {
-    if (ctx) await ctx.close().catch(() => undefined);
-    release();
   }
 }
 
@@ -92,7 +104,9 @@ async function getBookingUrl(placeId: string): Promise<string | null> {
     const page = await ctx.newPage();
     const url = `https://www.google.com/maps/place/?q=place_id:${placeId}`;
     await page.goto(url, { waitUntil: 'commit', timeout: PAGE_TIMEOUT_MS });
-    await page.waitForTimeout(POST_LOAD_MS);
+    // Wait for the place panel to hydrate — only the JS-rendered DOM
+    // exposes the Reserve anchor.
+    await page.waitForTimeout(5500);
 
     const reserveHref = await page.evaluate(() => {
       const anchors = document.querySelectorAll<HTMLAnchorElement>('a[href]');
@@ -117,45 +131,37 @@ async function getBookingUrl(placeId: string): Promise<string | null> {
   }
 }
 
-/* ─────────── Step 2: parse time slots ─────────── */
+/* ─────────── Step 2: parse time slots from HTML ─────────── */
 
 /**
- * The Reserve page renders time slots as 24-hour or 12-hour strings sprinkled
- * through the body text. We greedy-match anything that looks like HH:MM (or
- * HH:MM AM/PM) and keep only the ones within ±SLOT_WINDOW_MIN of the user's
- * target. Caps at 5 slots so the UI stays tidy.
+ * The Reserve page embeds slot data as `data-bts="<unix_seconds>"` on
+ * each <li> in the time picker. We pull every distinct timestamp,
+ * filter to ±SLOT_WINDOW_MIN around the user's target, and return up to
+ * 5 slots so the UI stays tidy.
+ *
+ * Why timestamps rather than the visible "19:30" text? The text appears
+ * many times in the page (operating hours, reviews, etc.) but `data-bts`
+ * is exclusive to the slot picker — much more precise.
  */
-function parseSlots(bodyText: string, isoTarget: string, bookingUrl: string): TimeSlot[] {
-  const target = new Date(isoTarget);
-  const targetMin = target.getHours() * 60 + target.getMinutes();
-  const re = /\b(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?\b/g;
+function parseSlotsFromHtml(html: string, isoTarget: string, bookingUrl: string): TimeSlot[] {
+  const targetMs = new Date(isoTarget).getTime();
+  const windowMs = SLOT_WINDOW_MIN * 60_000;
 
   const seen = new Set<number>();
-  const candidates: { mins: number; date: Date }[] = [];
-
+  const slots: { ms: number }[] = [];
+  const re = /data-bts="(\d{10})"/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(bodyText)) !== null) {
-    let h = parseInt(m[1], 10);
-    const min = parseInt(m[2], 10);
-    const suffix = (m[3] || '').toLowerCase();
-    if (suffix === 'pm' && h < 12) h += 12;
-    if (suffix === 'am' && h === 12) h = 0;
-    if (h > 23 || min > 59) continue;
-    // Filter out junky hits like "0:00" / "00:00" and review-relative times.
-    if (h < 6) continue; // restaurants don't open before 6 AM
-    const slotMin = h * 60 + min;
-    if (Math.abs(slotMin - targetMin) > SLOT_WINDOW_MIN) continue;
-    if (seen.has(slotMin)) continue;
-    seen.add(slotMin);
-
-    const d = new Date(target);
-    d.setHours(h, min, 0, 0);
-    candidates.push({ mins: slotMin, date: d });
+  while ((m = re.exec(html)) !== null) {
+    const ms = parseInt(m[1], 10) * 1000;
+    if (seen.has(ms)) continue;
+    if (Math.abs(ms - targetMs) > windowMs) continue;
+    seen.add(ms);
+    slots.push({ ms });
   }
 
-  candidates.sort((a, b) => a.mins - b.mins);
-  return candidates.slice(0, 5).map(({ date }) => ({
-    time: date.toISOString(),
+  slots.sort((a, b) => a.ms - b.ms);
+  return slots.slice(0, 5).map(({ ms }) => ({
+    time: new Date(ms).toISOString(),
     available: true,
     bookingUrl,
   }));
