@@ -4,55 +4,43 @@
  * TWO-STAGE FLOW per restaurant:
  *
  *   Stage A — Booking URL discovery (Playwright):
- *     Open https://www.google.com/maps/place/?q=place_id:<id> in headless
- *     Chromium with consent cookies pre-set. Find the "Reserve a table"
+ *     Open /maps/place/?q=place_id:<id>. Find the "Reserve a table"
  *     anchor; its href is the Google Reserve universal URL
- *     /maps/reserve/v/dine/c/<token>. Cached in memory by placeId so we
- *     only pay this cost once per restaurant per process lifetime.
+ *     /maps/reserve/v/dine/c/<token>. Cached per placeId.
  *
- *   Stage B — Slot scraping (PLAIN HTTP — no Playwright):
- *     The Reserve page is server-side rendered. The time-pill data lives
- *     directly in the HTML as `data-bts="<unix_seconds>"` attributes
- *     adjacent to the slot picker. A simple `fetch` with the same consent
- *     cookies gets the full page; a regex pulls out the timestamps.
+ *   Stage B — Slot extraction (Playwright + date-picker interaction):
+ *     Open the Reserve URL, click the date picker, click the user's
+ *     requested day. The slot list in the DOM updates client-side
+ *     (no XHR — slots are computed from an inline schedule the page
+ *     embeds), then we read the `data-bts="<unix_seconds>"` attributes
+ *     for the now-selected date and filter to ±60 min of target.
  *
- * Why two stages? Stage A still needs Playwright because the place page
- * is a Maps SPA where the Reserve anchor only appears after JS execution.
- * Stage B is plain HTML — bypassing Playwright there cuts ~10s/restaurant
- * and avoids the concurrency timeouts we saw in earlier iterations.
+ * Why Stage B can't be pure HTTP: a plain fetch returns the page with
+ * slots for the restaurant's NEXT available date only — May 16 even if
+ * the user asked for May 30. Earlier date-param tricks (?date=, etc.)
+ * are ignored by the server. The Reserve page's date picker is purely
+ * client-side; selecting a different day is the only way to surface
+ * its slots, and the JS that does so is too gnarly to reimplement.
+ *
+ * If the user's date isn't in the picker (restaurant fully booked /
+ * not bookable on that day), we fall back to the slots Google shows
+ * by default — flagged `nextAvailableDate: true` for the UI.
  *
  * STANDARDISED OUTPUT
  *   { time: ISO-8601, available: true, bookingUrl: <google reserve url> }
  * The `bookingUrl` deep-links into Google's flow which routes to whichever
- * underlying platform (OpenTable / Inline / OpenRice / Diningcity) the
+ * underlying partner (OpenTable / Inline / OpenRice / Diningcity) the
  * restaurant uses.
- *
- * LIMITATION
- *   The Reserve URL is opaque — `?date=…&time=…&size=…` params are ignored
- *   by the server, which always returns slots centred on ~19:00 for 2
- *   guests today. So this works best for dinner-time / today queries.
- *   For other windows we still rely on placeholder slots.
  */
 
-import type { BrowserContext } from 'playwright';
+import type { BrowserContext, Page } from 'playwright';
 import { acquire, getBrowser, newGoogleContext, release } from './playwright-pool';
 import type { TimeSlot } from './types';
 
-const PAGE_TIMEOUT_MS = 20_000;
+const PAGE_TIMEOUT_MS = 25_000;
+const POST_NAV_MS = 4000;         // wait for Reserve widget to hydrate
+const POST_CLICK_MS = 1500;       // wait after each picker interaction
 const SLOT_WINDOW_MIN = 60;       // ±60 minutes around requested time
-
-const RESERVE_FETCH_HEADERS = {
-  'User-Agent':
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept-Language': 'en-US,en;q=0.9',
-  // Consent cookies — same values Playwright contexts use. CONSENT=YES
-  // skips Google's consent interstitial; SOCS is set after a user clicks
-  // "Accept all" once and persists their choices.
-  Cookie:
-    'CONSENT=YES+cb.20210328-17-p0.en+FX+917; ' +
-    'SOCS=CAESHAgBEhJnd3NfMjAyNDA3MDgtMF9SQzIaAmVuIAEaBgiAyJq1Bg',
-};
 
 /* ─────────── Booking URL cache ─────────── */
 
@@ -69,25 +57,86 @@ export interface ReserveInput {
 
 /**
  * Given a Google placeId + requested date/time, return a standardised
- * list of ±1-hour TimeSlots scraped from Google's Reserve flow.
+ * list of ±1-hour TimeSlots scraped from Google's Reserve flow with
+ * the date picker driven to the user's requested day.
  * Returns an empty array if the restaurant has no Google booking link
  * (caller should fall back to placeholder slots).
  */
 export async function fetchReserveSlots(input: ReserveInput): Promise<TimeSlot[]> {
   const bookingUrl = await getBookingUrl(input.placeId);
   if (!bookingUrl) return [];
+
+  await acquire();
+  let ctx: BrowserContext | null = null;
   try {
-    const res = await fetch(bookingUrl, {
-      headers: RESERVE_FETCH_HEADERS,
-      // Cache same restaurant for 5 min — slot data only updates as
-      // bookings come in.
-      next: { revalidate: 300 },
-    });
-    if (!res.ok) return [];
-    const html = await res.text();
-    return parseSlotsFromHtml(html, input.dateTime, bookingUrl);
+    const browser = await getBrowser();
+    ctx = await newGoogleContext(browser);
+    const page = await ctx.newPage();
+    await page.goto(bookingUrl, { waitUntil: 'commit', timeout: PAGE_TIMEOUT_MS });
+    await page.waitForTimeout(POST_NAV_MS);
+
+    // Drive the date picker to the user's requested day. Falls through
+    // silently if the date is unavailable — we'll harvest whatever the
+    // page is currently showing and label it next-available.
+    const dateMatched = await selectDate(page, new Date(input.dateTime));
+    if (input.partySize !== 2) await selectPartySize(page, input.partySize);
+
+    const html = await page.content();
+    return parseSlotsFromHtml(html, input.dateTime, bookingUrl, dateMatched);
   } catch {
     return [];
+  } finally {
+    if (ctx) await ctx.close().catch(() => undefined);
+    release();
+  }
+}
+
+/**
+ * Click the date selector and pick the day matching `target`.
+ * Returns true if the date was actually selected, false if it wasn't
+ * in the dropdown (restaurant not bookable on that day).
+ *
+ * The picker dropdown items have aria-labels like "Saturday, 30 May";
+ * we match by full day-and-month so we don't pick the wrong month
+ * when day numbers repeat (e.g. "1 May" vs "1 June").
+ */
+async function selectDate(page: Page, target: Date): Promise<boolean> {
+  try {
+    await page
+      .locator('[aria-label*="reservation date" i]')
+      .first()
+      .click({ timeout: 4000 });
+    await page.waitForTimeout(600);
+
+    // "30 May" — matches the dropdown's aria-label like "Saturday, 30 May".
+    const dayMonth = target.toLocaleDateString('en-GB', {
+      day: 'numeric',
+      month: 'long',
+    });
+    const item = page.locator(`[aria-label*="${dayMonth}" i]`).first();
+    if (!(await item.count())) return false;
+    await item.click({ timeout: 4000 });
+    await page.waitForTimeout(POST_CLICK_MS);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function selectPartySize(page: Page, size: number): Promise<void> {
+  try {
+    await page
+      .locator('[aria-label*="party size" i]')
+      .first()
+      .click({ timeout: 3000 });
+    await page.waitForTimeout(500);
+    await page
+      .getByRole('option', { name: String(size) })
+      .first()
+      .click({ timeout: 3000 });
+    await page.waitForTimeout(POST_CLICK_MS);
+  } catch {
+    /* leave at default of 2 */
   }
 }
 
@@ -135,26 +184,24 @@ async function getBookingUrl(placeId: string): Promise<string | null> {
 
 /**
  * The Reserve page embeds slot data as `data-bts="<unix_seconds>"` on
- * each <li> in the time picker. We pull every distinct timestamp.
- *
- * Why timestamps rather than the visible "19:30" text? The text appears
- * many times in the page (operating hours, reviews, etc.) but `data-bts`
- * is exclusive to the slot picker — much more precise.
- *
- * Google's Reserve page is opaque about dates — it always returns slots
- * for the restaurant's NEXT available date, ignoring any URL params we
- * try to pass. So the slots may be for tomorrow, next week, or some
- * other date entirely.
+ * each <li> in the time picker. After Playwright drives the date picker
+ * to the user's requested day, the DOM updates client-side and the
+ * `data-bts` attributes reflect that day's slot times.
  *
  * Behaviour:
- *   - If the slots fall within ±SLOT_WINDOW_MIN of the user's target,
- *     return them as confirmed slots for the requested day.
- *   - If they fall OUTSIDE that window, return up to 5 of the
- *     earliest-available slots flagged `nextAvailableDate: true` so the
- *     UI can render a "Next available: <date>" badge instead of
- *     pretending they match the user's requested time.
+ *   - If `dateMatched` is true (Playwright successfully picked the user's
+ *     date) and the slots fall within ±SLOT_WINDOW_MIN of target, return
+ *     them as confirmed slots.
+ *   - Otherwise, return whatever the page is showing — likely the
+ *     restaurant's next-available date — flagged `nextAvailableDate`
+ *     so the UI can render a "Earliest open: <date>" badge.
  */
-function parseSlotsFromHtml(html: string, isoTarget: string, bookingUrl: string): TimeSlot[] {
+function parseSlotsFromHtml(
+  html: string,
+  isoTarget: string,
+  bookingUrl: string,
+  dateMatched: boolean
+): TimeSlot[] {
   const targetMs = new Date(isoTarget).getTime();
   const windowMs = SLOT_WINDOW_MIN * 60_000;
 
@@ -173,7 +220,7 @@ function parseSlotsFromHtml(html: string, isoTarget: string, bookingUrl: string)
   allSlots.sort((a, b) => a - b);
   const inWindow = allSlots.filter((ms) => Math.abs(ms - targetMs) <= windowMs);
 
-  if (inWindow.length > 0) {
+  if (dateMatched && inWindow.length > 0) {
     return inWindow.slice(0, 5).map((ms) => ({
       time: new Date(ms).toISOString(),
       available: true,
@@ -181,8 +228,9 @@ function parseSlotsFromHtml(html: string, isoTarget: string, bookingUrl: string)
     }));
   }
 
-  // Out-of-window: slots are for a different day. Pick the 5 closest
-  // to the user's target (chronologically) and flag them.
+  // Either Playwright couldn't pick the user's date, or no slots
+  // are within their requested time window. Surface the 5 earliest
+  // visible slots flagged as next-available so the UI can banner them.
   return allSlots.slice(0, 5).map((ms) => ({
     time: new Date(ms).toISOString(),
     available: true,
