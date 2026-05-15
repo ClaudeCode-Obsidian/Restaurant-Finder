@@ -65,42 +65,58 @@ export function RestaurantCard({
           <p className="mt-1 text-sm text-gray-600 line-clamp-2">{r.description}</p>
         )}
 
-        {r.availability && r.availability.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            {r.availability.slice(0, 5).map((slot) => {
-              const time = new Date(slot.time).toLocaleTimeString('en-GB', {
-                hour: '2-digit',
-                minute: '2-digit',
-              });
-              const href = slot.bookingUrl ?? r.bookingUrl ?? r.websiteUrl;
-              const Pill = (
-                <span
-                  className={`inline-flex items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium text-white transition ${
-                    slot.available
-                      ? 'bg-brand-red hover:bg-red-700'
-                      : 'bg-gray-400 hover:bg-gray-500'
-                  }`}
-                >
-                  {time}
-                  {!slot.available && <sup className="ml-0.5">*</sup>}
-                </span>
-              );
-              return href ? (
-                <a key={slot.time} href={href} target="_blank" rel="noopener noreferrer">
-                  {Pill}
-                </a>
-              ) : (
-                <div key={slot.time}>{Pill}</div>
-              );
-            })}
-          </div>
-        )}
-
-        {r.availability?.some((s) => !s.available) && (
-          <p className="mt-2 text-xs text-gray-400">
-            * Live availability unknown — click to confirm on the booking site.
-          </p>
-        )}
+        {r.availability && r.availability.length > 0 && (() => {
+          const nextDate = r.availability.find((s) => s.nextAvailableDate)?.time;
+          const nextDateLabel = nextDate
+            ? new Date(nextDate).toLocaleDateString('en-GB', {
+                weekday: 'short', day: 'numeric', month: 'short',
+              })
+            : null;
+          return (
+            <>
+              {nextDateLabel && (
+                <p className="mt-2 text-xs text-amber-700 font-medium">
+                  Not available at your time — earliest open: {nextDateLabel}
+                </p>
+              )}
+              <div className="mt-2 flex flex-wrap gap-2">
+                {r.availability.slice(0, 5).map((slot) => {
+                  const time = new Date(slot.time).toLocaleTimeString('en-GB', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  });
+                  const href = slot.bookingUrl ?? r.bookingUrl ?? r.websiteUrl;
+                  const Pill = (
+                    <span
+                      className={`inline-flex items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium text-white transition ${
+                        slot.available && !slot.nextAvailableDate
+                          ? 'bg-brand-red hover:bg-red-700'
+                          : slot.nextAvailableDate
+                          ? 'bg-amber-600 hover:bg-amber-700'
+                          : 'bg-gray-400 hover:bg-gray-500'
+                      }`}
+                    >
+                      {time}
+                      {!slot.available && <sup className="ml-0.5">*</sup>}
+                    </span>
+                  );
+                  return href ? (
+                    <a key={slot.time} href={href} target="_blank" rel="noopener noreferrer">
+                      {Pill}
+                    </a>
+                  ) : (
+                    <div key={slot.time}>{Pill}</div>
+                  );
+                })}
+              </div>
+              {r.availability.some((s) => !s.available) && (
+                <p className="mt-2 text-xs text-gray-400">
+                  * Live availability unknown — click to confirm on the booking site.
+                </p>
+              )}
+            </>
+          );
+        })()}
       </div>
     </article>
   );

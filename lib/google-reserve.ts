@@ -135,34 +135,58 @@ async function getBookingUrl(placeId: string): Promise<string | null> {
 
 /**
  * The Reserve page embeds slot data as `data-bts="<unix_seconds>"` on
- * each <li> in the time picker. We pull every distinct timestamp,
- * filter to ±SLOT_WINDOW_MIN around the user's target, and return up to
- * 5 slots so the UI stays tidy.
+ * each <li> in the time picker. We pull every distinct timestamp.
  *
  * Why timestamps rather than the visible "19:30" text? The text appears
  * many times in the page (operating hours, reviews, etc.) but `data-bts`
  * is exclusive to the slot picker — much more precise.
+ *
+ * Google's Reserve page is opaque about dates — it always returns slots
+ * for the restaurant's NEXT available date, ignoring any URL params we
+ * try to pass. So the slots may be for tomorrow, next week, or some
+ * other date entirely.
+ *
+ * Behaviour:
+ *   - If the slots fall within ±SLOT_WINDOW_MIN of the user's target,
+ *     return them as confirmed slots for the requested day.
+ *   - If they fall OUTSIDE that window, return up to 5 of the
+ *     earliest-available slots flagged `nextAvailableDate: true` so the
+ *     UI can render a "Next available: <date>" badge instead of
+ *     pretending they match the user's requested time.
  */
 function parseSlotsFromHtml(html: string, isoTarget: string, bookingUrl: string): TimeSlot[] {
   const targetMs = new Date(isoTarget).getTime();
   const windowMs = SLOT_WINDOW_MIN * 60_000;
 
   const seen = new Set<number>();
-  const slots: { ms: number }[] = [];
+  const allSlots: number[] = [];
   const re = /data-bts="(\d{10})"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
     const ms = parseInt(m[1], 10) * 1000;
     if (seen.has(ms)) continue;
-    if (Math.abs(ms - targetMs) > windowMs) continue;
     seen.add(ms);
-    slots.push({ ms });
+    allSlots.push(ms);
+  }
+  if (allSlots.length === 0) return [];
+
+  allSlots.sort((a, b) => a - b);
+  const inWindow = allSlots.filter((ms) => Math.abs(ms - targetMs) <= windowMs);
+
+  if (inWindow.length > 0) {
+    return inWindow.slice(0, 5).map((ms) => ({
+      time: new Date(ms).toISOString(),
+      available: true,
+      bookingUrl,
+    }));
   }
 
-  slots.sort((a, b) => a.ms - b.ms);
-  return slots.slice(0, 5).map(({ ms }) => ({
+  // Out-of-window: slots are for a different day. Pick the 5 closest
+  // to the user's target (chronologically) and flag them.
+  return allSlots.slice(0, 5).map((ms) => ({
     time: new Date(ms).toISOString(),
     available: true,
     bookingUrl,
+    nextAvailableDate: true,
   }));
 }

@@ -25,6 +25,13 @@ export interface TimeSlot {
   available: boolean;
   /** Deep-link to the booking platform's reservation page for this slot. */
   bookingUrl?: string;
+  /**
+   * True when this slot is real but for a DIFFERENT day than the user
+   * asked for — e.g. the user searched "May 30" but the restaurant's
+   * earliest opening is "May 16". The UI shows these with a
+   * "Next available: <date>" badge instead of pretending they match.
+   */
+  nextAvailableDate?: boolean;
 }
 
 export interface Restaurant {
