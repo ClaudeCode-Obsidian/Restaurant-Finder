@@ -64,17 +64,20 @@ export async function GET(req: NextRequest) {
         }),
       ]);
       const blurb = describe.description;
-      // Four-tier fallback for price (each step kicks in only if prior was 0):
-      //   1. Google Maps price-range histogram — accurate HKD ranges, free
-      //      from the same Playwright visit we use for the Reserve URL.
-      //   2. Google Places `priceLevel` enum — sparse in HK (chains only).
-      //   3. Claude's estimate from cuisine + rating + name.
-      //   4. Cuisine-aware hardcoded default — guarantees we never show N/A.
-      const priceTier =
+      // Price resolution. Calibration probe (60 HK restaurants) showed
+      // Google's Maps histogram caps at $500+ for ALL upper-tier places,
+      // so Maps alone can't distinguish tier 5 ($401–800) from tier 6
+      // (Over $801). Places API's `priceLevel` IS reliable at the top —
+      // when it says VERY_EXPENSIVE we always trust it over Maps.
+      //
+      // Otherwise: fall through Maps → Places → Claude → cuisine default.
+      let priceTier =
         mapsPriceTier > 0 ? mapsPriceTier
         : googlePlacesTier > 0 ? googlePlacesTier
         : describe.estimatedPriceTier > 0 ? describe.estimatedPriceTier
         : defaultTierFromCuisine(p.cuisine, p.rating ?? 0);
+      // Override: trust Places API's top-tier label over a capped Maps signal.
+      if (googlePlacesTier === 6 && priceTier < 6) priceTier = 6;
       const priceLabel = PRICE_LABELS[priceTier];
       return {
         placeId: p.placeId!,
