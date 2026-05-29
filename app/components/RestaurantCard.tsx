@@ -8,7 +8,7 @@
  * if we couldn't verify the slot.
  */
 
-import type { Restaurant } from '@/lib/types';
+import type { Restaurant, TimeSlot } from '@/lib/types';
 
 export function RestaurantCard({
   r,
@@ -65,56 +65,97 @@ export function RestaurantCard({
           <p className="mt-1 text-sm text-gray-600 line-clamp-2">{r.description}</p>
         )}
 
-        {r.availability && r.availability.length > 0 && (() => {
-          const nextDate = r.availability.find((s) => s.nextAvailableDate)?.time;
-          const nextDateLabel = nextDate
-            ? new Date(nextDate).toLocaleDateString('en-GB', {
-                weekday: 'short', day: 'numeric', month: 'short',
-              })
-            : null;
+        {r.availability && (() => {
+          const isAmber = (s: TimeSlot) => s.nextAvailableDate || s.nextAvailableTime;
+          // "Real" slots = anything bookable: green (right time) or amber
+          // (alternative time/date). All of these have available === true.
+          const hasRealSlots = r.availability.some((s) => s.available);
+
+          if (hasRealSlots) {
+            // Banner states from most- to least-correct:
+            //   nextAvailableTime → right date, wrong time of day
+            //   nextAvailableDate → wrong date entirely
+            //   neither           → green: real slots near requested time
+            const nextDateSlot = r.availability.find((s) => s.nextAvailableDate);
+            const nextTimeSlot = r.availability.find((s) => s.nextAvailableTime);
+            const dateLabel = (iso?: string) =>
+              iso
+                ? new Date(iso).toLocaleDateString('en-GB', {
+                    weekday: 'short', day: 'numeric', month: 'short',
+                  })
+                : null;
+            const banner = nextTimeSlot
+              ? `Other times on ${dateLabel(nextTimeSlot.time)} — click a slot to pick your time`
+              : nextDateSlot
+              ? `Not available at your time — earliest open: ${dateLabel(nextDateSlot.time)}`
+              : null;
+            return (
+              <>
+                {banner && (
+                  <p className="mt-2 text-xs text-amber-700 font-medium">{banner}</p>
+                )}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {r.availability.slice(0, 5).map((slot) => {
+                    const time = new Date(slot.time).toLocaleTimeString('en-GB', {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    });
+                    const href = slot.bookingUrl ?? r.bookingUrl ?? r.websiteUrl;
+                    const Pill = (
+                      <span
+                        className={`inline-flex items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium text-white transition ${
+                          isAmber(slot)
+                            ? 'bg-amber-600 hover:bg-amber-700'
+                            : 'bg-brand-red hover:bg-red-700'
+                        }`}
+                      >
+                        {time}
+                      </span>
+                    );
+                    return href ? (
+                      <a key={slot.time} href={href} target="_blank" rel="noopener noreferrer">
+                        {Pill}
+                      </a>
+                    ) : (
+                      <div key={slot.time}>{Pill}</div>
+                    );
+                  })}
+                </div>
+              </>
+            );
+          }
+
+          // No bookable slots — tell the user WHY, in plain language.
+          // Three distinct cases, instead of one catch-all "unknown":
+          //   no_booking_link → this place takes no online reservations
+          //   check_failed    → a booking system exists but our check failed
+          //   no_slots        → checked fine, nothing free near the request
+          const status = r.availabilityStatus ?? 'no_slots';
+          const href = r.bookingUrl ?? r.websiteUrl;
+          const msg =
+            status === 'no_booking_link'
+              ? 'No booking link identified'
+              : status === 'check_failed'
+              ? 'Booking link identified but inaccessible, please visit booking link'
+              : 'No available slots near your selected date & time';
+          // Only the "inaccessible booking link" case is actionable as a link,
+          // and only when we actually have somewhere to send the user.
+          const linkable = !!href && status === 'check_failed';
           return (
-            <>
-              {nextDateLabel && (
-                <p className="mt-2 text-xs text-amber-700 font-medium">
-                  Not available at your time — earliest open: {nextDateLabel}
-                </p>
+            <p className="mt-2 text-xs text-gray-500">
+              {linkable ? (
+                <a
+                  href={href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:text-gray-700"
+                >
+                  {msg}
+                </a>
+              ) : (
+                msg
               )}
-              <div className="mt-2 flex flex-wrap gap-2">
-                {r.availability.slice(0, 5).map((slot) => {
-                  const time = new Date(slot.time).toLocaleTimeString('en-GB', {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  });
-                  const href = slot.bookingUrl ?? r.bookingUrl ?? r.websiteUrl;
-                  const Pill = (
-                    <span
-                      className={`inline-flex items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium text-white transition ${
-                        slot.available && !slot.nextAvailableDate
-                          ? 'bg-brand-red hover:bg-red-700'
-                          : slot.nextAvailableDate
-                          ? 'bg-amber-600 hover:bg-amber-700'
-                          : 'bg-gray-400 hover:bg-gray-500'
-                      }`}
-                    >
-                      {time}
-                      {!slot.available && <sup className="ml-0.5">*</sup>}
-                    </span>
-                  );
-                  return href ? (
-                    <a key={slot.time} href={href} target="_blank" rel="noopener noreferrer">
-                      {Pill}
-                    </a>
-                  ) : (
-                    <div key={slot.time}>{Pill}</div>
-                  );
-                })}
-              </div>
-              {r.availability.some((s) => !s.available) && (
-                <p className="mt-2 text-xs text-gray-400">
-                  * Live availability unknown — click to confirm on the booking site.
-                </p>
-              )}
-            </>
+            </p>
           );
         })()}
       </div>
