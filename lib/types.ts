@@ -32,7 +32,30 @@ export interface TimeSlot {
    * "Next available: <date>" badge instead of pretending they match.
    */
   nextAvailableDate?: boolean;
+  /**
+   * True when this slot IS on the user's requested day, but at a
+   * different time of day than they asked for — e.g. they searched
+   * "May 28 at 19:00" but only the lunch service (11:00–13:00) is
+   * visible on Google Reserve's default view. The UI shows these
+   * with an "Other times on <date>" banner so the user understands
+   * the date is right but the time isn't.
+   */
+  nextAvailableTime?: boolean;
 }
+
+/**
+ * Why a restaurant's availability looks the way it does. Drives which
+ * message the card shows when there are no directly-bookable (green) slots:
+ *   - 'available'       → we found real slots (green and/or amber alternatives)
+ *   - 'no_booking_link' → no reservation system found (walk-in only) → message 1
+ *   - 'check_failed'    → a booking system exists but we couldn't read it → message 2
+ *   - 'no_slots'        → checked OK, nothing available near the request → message 3
+ */
+export type AvailabilityStatus =
+  | 'available'
+  | 'no_booking_link'
+  | 'check_failed'
+  | 'no_slots';
 
 export interface Restaurant {
   /** Google Places place_id — stable unique identifier. */
@@ -59,6 +82,8 @@ export interface Restaurant {
   bookingUrl?: string;
   /** Up to ~5 time slots near the requested time. */
   availability?: TimeSlot[];
+  /** Why availability looks the way it does — picks the card's message. */
+  availabilityStatus?: AvailabilityStatus;
 }
 
 export interface SearchQuery {

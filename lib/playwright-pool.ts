@@ -1,18 +1,38 @@
 /**
  * Shared Playwright browser pool.
  *
- * Used by both lib/openrice.ts and lib/google-reserve.ts so we launch
+ * Used by lib/openrice.ts and lib/google-reserve.ts so we launch
  * Chromium *once* per Node process (browser launch is ~1–2 s; expensive).
  *
  * Concurrency is capped at MAX_CONCURRENT pages across the whole app —
- * not per module — so a single /api/restaurants request that needs both
- * an OpenRice scrape AND a Google Reserve lookup for 12 restaurants
- * doesn't open 24 simultaneous browser pages and exhaust memory.
+ * not per module — so a single /api/restaurants request doesn't open
+ * dozens of simultaneous browser pages and exhaust memory.
+ *
+ * Set to 4 (was 8) for two reasons:
+ *   1. OpenRice's HTTP booking API now handles ~60-70% of availability
+ *      lookups (see lib/openrice-booking.ts), so the Playwright path is
+ *      only exercised for the long tail of restaurants OpenRice doesn't
+ *      cover. Less parallelism is needed.
+ *   2. At 8x parallel, the Google Reserve anchor was injecting too
+ *      slowly on heavy pages (Pici Central, 10k+ reviews) — the 8 s
+ *      timeout in google-reserve.ts was timing out under network/CPU
+ *      contention. 4x gives each Maps page enough breathing room that
+ *      Reserve injection comfortably completes within the bounded wait.
+ *
+ * Each restaurant still does at most TWO sequential Playwright visits
+ * (Maps place page → Reserve page), so peak concurrent pages stays at 4,
+ * not 8.
  */
 
 import { chromium, type Browser, type BrowserContext } from 'playwright';
 
-const MAX_CONCURRENT = 3;
+// Raised 4 → 6. With 8 restaurants per search and two sequential Playwright
+// visits each (Maps page → Reserve page), a cap of 4 meant up to half the
+// restaurants sat queued long enough that their Reserve check timed out and
+// fell back to the "couldn't confirm" placeholder. 6 lets more run in
+// parallel without overwhelming a typical dev machine; revisit if memory
+// pressure or Reserve-anchor injection slowness reappears under load.
+const MAX_CONCURRENT = 6;
 
 /* ─────────── Browser singleton ─────────── */
 
@@ -93,10 +113,24 @@ export async function newGoogleContext(browser: Browser): Promise<BrowserContext
     Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
   });
-  // Note: we intentionally DON'T block images/fonts here — Google Maps and
-  // Google Reserve sometimes hang `domcontentloaded` when subresources are
-  // aborted by route filters. Speed-conscious modules (OpenRice) can attach
-  // their own route filter on the context they get from this factory.
+
+  // EXPERIMENT (revertable): block ONLY pure-overhead requests.
+  // We do NOT block images/fonts/media yet — earlier testing showed
+  // that on heavy restaurant pages (Pici Central, ~10 k reviews), the
+  // Reserve anchor failed to inject when subresources were blocked.
+  // Likely the page's JS observes asset load state before triggering
+  // Reserve injection.
+  //
+  // Analytics beacons are pure fire-and-forget; killing them is
+  // safe and saves a measurable amount of CPU on every visit.
+  await ctx.route('**/*', (route) => {
+    const url = route.request().url();
+    if (/(google-analytics|googletagmanager|doubleclick|google\.com\/log\b)/.test(url)) {
+      return route.abort();
+    }
+    return route.continue();
+  });
+
   return ctx;
 }
 

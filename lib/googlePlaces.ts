@@ -84,43 +84,102 @@ interface RawPlace {
   primaryTypeDisplayName?: { text: string };
 }
 
+/**
+ * The Places API (New) `searchText` endpoint caps `maxResultCount` at 20
+ * per request. To return more, we follow `nextPageToken` and concatenate
+ * pages. Google attaches the location filter to the *first* request only —
+ * subsequent paged requests echo the token alone, which is correct.
+ */
+const PAGE_MAX = 20;
+
+/**
+ * Default location bias: a circle centred on Hong Kong.
+ *
+ * The radius is set to 50 km because Google's Places API (New) caps
+ * `circle.radius` at exactly 50,000 m — anything larger returns
+ * `INVALID_ARGUMENT`. 50 km is still enough to cover the entire HK
+ * SAR (the territory spans ~50 km east-west and ~40 km north-south
+ * including outlying islands), so this bias places every HK
+ * restaurant comfortably inside the circle.
+ *
+ * Note this is a "bias" not a "restriction" — Google may still return
+ * results outside the circle if the textQuery strongly identifies a
+ * place elsewhere. But for ambiguous queries the bias dominates
+ * ranking.
+ *
+ * Concrete case this fixes: `q=Sole Mio Italian Restaurant` with no
+ * city qualifier used to resolve to O'Sole Mio in London (1,508
+ * reviews) instead of HK Sole Mio (284 reviews). With the bias,
+ * Google scores nearby matches higher and HK Sole Mio wins.
+ *
+ * Centre: 22.3193°N, 114.1694°E — Tsim Sha Tsui, the centre of
+ * Hong Kong's urban core.
+ */
+const HK_LOCATION_BIAS = {
+  lat: 22.3193,
+  lng: 114.1694,
+  radiusMeters: 50_000,
+};
+
 export async function searchPlaces(input: PlaceSearchInput): Promise<Partial<Restaurant>[]> {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) throw new Error('GOOGLE_MAPS_API_KEY is not set');
 
-  const body: Record<string, unknown> = {
-    textQuery: input.textQuery,
-    maxResultCount: input.maxResults ?? 20,
-    includedType: 'restaurant',
-  };
-  if (input.openNow !== undefined) body.openNow = input.openNow;
-  if (input.locationBias) {
+  const target = input.maxResults ?? 20;
+  const results: Partial<Restaurant>[] = [];
+  let pageToken: string | undefined;
+
+  // Apply the HK bias by default; an explicit caller-supplied bias
+  // overrides it. (For tests / future multi-region support.)
+  const bias = input.locationBias ?? HK_LOCATION_BIAS;
+
+  // Loop until we have enough, or Google runs out of pages.
+  while (results.length < target) {
+    const remaining = target - results.length;
+    const body: Record<string, unknown> = {
+      textQuery: input.textQuery,
+      maxResultCount: Math.min(remaining, PAGE_MAX),
+      includedType: 'restaurant',
+    };
+    if (input.openNow !== undefined) body.openNow = input.openNow;
     body.locationBias = {
       circle: {
-        center: { latitude: input.locationBias.lat, longitude: input.locationBias.lng },
-        radius: input.locationBias.radiusMeters ?? 5000,
+        center: { latitude: bias.lat, longitude: bias.lng },
+        radius: bias.radiusMeters ?? 5000,
       },
     };
+    if (pageToken) body.pageToken = pageToken;
+
+    const res = await fetch(`${BASE}/places:searchText`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask': SEARCH_FIELDS + ',nextPageToken',
+      },
+      body: JSON.stringify(body),
+      // Cache identical queries for 5 minutes to lower API spend.
+      // The cache key includes the request body so paged requests are
+      // cached independently — fine, since they're deterministic.
+      next: { revalidate: 300 },
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Google Places search failed (${res.status}): ${text}`);
+    }
+    const data = (await res.json()) as { places?: RawPlace[]; nextPageToken?: string };
+    const page = (data.places ?? []).map(normalize);
+    results.push(...page);
+
+    // Stop if Google has nothing more, or this page was empty (defensive
+    // against an infinite loop if the API ever returns an empty page +
+    // a still-valid token).
+    pageToken = data.nextPageToken;
+    if (!pageToken || page.length === 0) break;
   }
 
-  const res = await fetch(`${BASE}/places:searchText`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Goog-Api-Key': apiKey,
-      'X-Goog-FieldMask': SEARCH_FIELDS,
-    },
-    body: JSON.stringify(body),
-    // Cache identical queries for 5 minutes to lower API spend.
-    next: { revalidate: 300 },
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Google Places search failed (${res.status}): ${text}`);
-  }
-  const data = (await res.json()) as { places?: RawPlace[] };
-  return (data.places ?? []).map(normalize);
+  return results.slice(0, target);
 }
 
 function normalize(p: RawPlace): Partial<Restaurant> {
