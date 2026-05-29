@@ -17,3 +17,68 @@
   background-size: 800px;
   animation: shimmer 1.5s infinite linear;
 }
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Floating cuisine bubbles — see app/components/CuisineBubbles.tsx
+ *
+ * The "skin" is three stacked layers:
+ *   1. A conic-gradient that supplies the rainbow iridescence
+ *   2. A radial highlight (white spotlight, top-left) to fake a specular
+ *   3. Inset shadows for a wet, glassy rim
+ *
+ * Plus an outer drop-shadow for the floating-in-mid-air feel.
+ *
+ * Four keyframe variants so the bubbles drift on independent rhythms.
+ * The `--drift` CSS variable is per-bubble (set inline in React) so each
+ * one moves a slightly different distance, avoiding a marching-band look.
+ * ───────────────────────────────────────────────────────────────────── */
+
+.bubble-skin {
+  background:
+    /* specular highlight — bright spot top-left */
+    radial-gradient(circle at 28% 24%, rgba(255,255,255,0.85) 0%, rgba(255,255,255,0.25) 18%, transparent 38%),
+    /* secondary highlight — soft glow bottom-right */
+    radial-gradient(circle at 75% 80%, rgba(255,255,255,0.35) 0%, transparent 40%),
+    /* iridescent body */
+    conic-gradient(from 210deg at 50% 50%,
+      rgba(255,180,220,0.55),
+      rgba(190,220,255,0.55),
+      rgba(200,255,220,0.55),
+      rgba(255,235,180,0.55),
+      rgba(230,190,255,0.55),
+      rgba(180,240,255,0.55),
+      rgba(255,180,220,0.55));
+  box-shadow:
+    inset 0 0 24px rgba(255,255,255,0.35),
+    inset -8px -10px 28px rgba(160,180,255,0.22),
+    inset 6px 8px 18px rgba(255,255,255,0.25),
+    0 8px 24px rgba(150,170,220,0.25);
+  backdrop-filter: blur(2px);
+}
+
+/* Four independent float patterns. Each blends a horizontal drift (sign
+ * varies) with a vertical bob, plus a tiny scale wobble to suggest the
+ * bubble breathing under surface tension. */
+@keyframes bubble-float-0 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50%      { transform: translate(var(--drift), -22px) scale(1.04); }
+}
+@keyframes bubble-float-1 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50%      { transform: translate(calc(var(--drift) * -1), -16px) scale(1.06); }
+}
+@keyframes bubble-float-2 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33%      { transform: translate(calc(var(--drift) * 0.6), -18px) scale(1.03); }
+  66%      { transform: translate(calc(var(--drift) * -0.7), -10px) scale(1.05); }
+}
+@keyframes bubble-float-3 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50%      { transform: translate(calc(var(--drift) * 0.4), -28px) scale(1.02); }
+}
+
+/* Respect users who'd rather things hold still. */
+@media (prefers-reduced-motion: reduce) {
+  .bubble-skin { animation: none !important; }
+  [class*='bubble-float-'] { animation: none !important; }
+}
