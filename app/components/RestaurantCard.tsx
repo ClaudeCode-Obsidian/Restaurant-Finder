@@ -23,7 +23,7 @@ export function RestaurantCard({
       onMouseLeave={() => onHover?.(null)}
       className="flex gap-4 border-b border-gray-100 py-5 last:border-0 group"
     >
-      <div className="relative h-32 w-44 shrink-0 overflow-hidden rounded-lg bg-gray-100">
+      <div className="relative h-24 w-28 sm:h-32 sm:w-44 shrink-0 overflow-hidden rounded-lg bg-gray-100">
         {r.photoUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img

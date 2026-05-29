@@ -280,7 +280,10 @@ export function FilterPanel({
   // ───────────────────────── Compact (results-header) layout ──────────────
   if (compact) {
     return (
-      <div className="flex w-full items-center gap-1.5">
+      // flex-wrap so the six controls + button reflow onto multiple rows on
+      // narrow phones instead of being crushed into one unreadable line. On
+      // wide screens they all fit and stay on a single row automatically.
+      <div className="flex flex-wrap w-full items-center gap-1.5">
         <Select value={date} onChange={setDate} options={dates} compact />
         <Select value={time} onChange={setTime} options={TIMES} compact />
         {cuisineOther ? (
@@ -388,7 +391,7 @@ function TextInput({
       autoFocus
       className={
         compact
-          ? 'min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-xs text-gray-900 focus:border-brand-red focus:ring-2 focus:ring-brand-red/20 focus:outline-none'
+          ? 'min-w-[92px] flex-1 rounded-lg border border-gray-200 bg-white px-2 py-2 text-xs text-gray-900 focus:border-brand-red focus:ring-2 focus:ring-brand-red/20 focus:outline-none'
           : 'mt-1 w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-900 focus:border-brand-red focus:ring-2 focus:ring-brand-red/20 focus:outline-none'
       }
     />
@@ -412,7 +415,7 @@ function Select({
       onChange={(e) => onChange(e.target.value)}
       className={
         compact
-          ? 'min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-xs text-gray-900 focus:border-brand-red focus:ring-2 focus:ring-brand-red/20 focus:outline-none appearance-none cursor-pointer'
+          ? 'min-w-[92px] flex-1 rounded-lg border border-gray-200 bg-white px-2 py-2 text-xs text-gray-900 focus:border-brand-red focus:ring-2 focus:ring-brand-red/20 focus:outline-none appearance-none cursor-pointer'
           : 'w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-900 focus:border-brand-red focus:ring-2 focus:ring-brand-red/20 focus:outline-none appearance-none cursor-pointer'
       }
     >

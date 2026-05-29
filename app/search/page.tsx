@@ -187,7 +187,7 @@ function SkeletonList({ count = 5 }: { count?: number }) {
     <div className="space-y-5 py-3">
       {Array.from({ length: count }).map((_, i) => (
         <div key={i} className="flex gap-4">
-          <div className="h-32 w-44 rounded-lg shimmer" />
+          <div className="h-24 w-28 sm:h-32 sm:w-44 rounded-lg shimmer" />
           <div className="flex-1 space-y-2">
             <div className="h-5 w-2/3 rounded shimmer" />
             <div className="h-4 w-1/2 rounded shimmer" />
