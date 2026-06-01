@@ -39,15 +39,68 @@ const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-/* ─────────── POI ID resolution (with cache) ─────────── */
+/* ─────────── Observability ─────────── */
 
 /**
- * In-memory cache keyed by `${name}|${district ?? ''}`. POI IDs are
- * extremely stable (OpenRice doesn't recycle them across restaurant
- * closures), so a process-lifetime cache is fine here. Values can be
- * `null` to remember misses and avoid re-querying.
+ * OpenRice is an undocumented API that fails in many quiet ways (rate-limit,
+ * shape drift, coverage gap, booking cutoff). The old code swallowed every
+ * one of these as a bare `[]`, so a search that silently fell through to the
+ * slow Reserve scraper left no trace and was impossible to diagnose. We now
+ * log a one-line, greppable reason for every non-success.
+ *
+ *   - 'warn'  → something unexpected (HTTP error, thrown fetch, bad shape).
+ *               Worth noticing; may indicate the API changed or is blocking.
+ *   - 'debug' → an expected, benign fall-through (not on OpenRice, booking
+ *               disabled, no slots near the time). Normal for ~30–40% of
+ *               restaurants; logged so the fall-through is still visible.
  */
-const _poiCache = new Map<string, number | null>();
+function logOpenRice(level: 'warn' | 'debug', restaurant: string, reason: string): void {
+  const msg = `[openrice] "${restaurant}": ${reason}`;
+  if (level === 'warn') console.warn(msg);
+  else console.debug(msg);
+}
+
+/* ─────────── POI ID resolution (with TTL cache) ─────────── */
+
+/**
+ * In-memory cache keyed by `${name}|${district ?? ''}`.
+ *
+ * Entries carry an expiry. The old cache stored values forever AND cached
+ * misses — so a single transient OpenRice hiccup early in the server's life
+ * stamped a restaurant "not found" permanently, and every later search
+ * skipped straight to the slow Reserve path. (Observed live: a 3-day-old
+ * process returned nothing for restaurants a fresh process resolved fine.)
+ *
+ * Fixed policy:
+ *   - real match  → cached POI_HIT_TTL_MS (POI IDs are stable, so this is long).
+ *   - genuine "no such restaurant on OpenRice" → cached POI_MISS_TTL_MS only,
+ *     so a temporary outage can't blacklist a real restaurant for the whole
+ *     process lifetime — it self-heals after a few minutes.
+ *   - transient failure (network throw, non-200) → NOT cached at all; retried
+ *     on the next search.
+ */
+interface PoiCacheEntry {
+  poiId: number | null;
+  expires: number;
+}
+const _poiCache = new Map<string, PoiCacheEntry>();
+const POI_HIT_TTL_MS = 24 * 60 * 60 * 1000; // 24h — a confirmed match
+const POI_MISS_TTL_MS = 10 * 60 * 1000; // 10 min — a genuine "not found"
+
+/** Read through the TTL cache. `undefined` = not cached (or expired). */
+function poiCacheGet(key: string): number | null | undefined {
+  const e = _poiCache.get(key);
+  if (!e) return undefined;
+  if (Date.now() > e.expires) {
+    _poiCache.delete(key);
+    return undefined;
+  }
+  return e.poiId;
+}
+
+function poiCacheSet(key: string, poiId: number | null, ttlMs: number): void {
+  _poiCache.set(key, { poiId, expires: Date.now() + ttlMs });
+}
 
 interface SearchHit {
   poiId: number;
@@ -72,7 +125,8 @@ export async function searchOpenRicePoi(
   districtHint?: string,
 ): Promise<number | null> {
   const key = `${name.toLowerCase()}|${(districtHint ?? '').toLowerCase()}`;
-  if (_poiCache.has(key)) return _poiCache.get(key)!;
+  const cached = poiCacheGet(key);
+  if (cached !== undefined) return cached;
 
   try {
     const url =
@@ -82,7 +136,9 @@ export async function searchOpenRicePoi(
       headers: { Accept: 'application/json', 'User-Agent': UA },
     });
     if (!res.ok) {
-      _poiCache.set(key, null);
+      // Transient (rate-limit, 5xx, momentary block). DON'T cache — a bad
+      // moment shouldn't blacklist this name for the process lifetime.
+      logOpenRice('warn', name, `search HTTP ${res.status} — not caching (transient)`);
       return null;
     }
     const data = (await res.json()) as {
@@ -93,7 +149,10 @@ export async function searchOpenRicePoi(
     // `paginationResult.results`, sometimes `searchedPoi`.
     const results = data.paginationResult?.results ?? data.searchedPoi ?? [];
     if (results.length === 0) {
-      _poiCache.set(key, null);
+      // Genuine "no such restaurant on OpenRice" — safe to cache, but only
+      // briefly so a transient empty response can still recover.
+      logOpenRice('debug', name, 'search returned no results — cached as miss (10m)');
+      poiCacheSet(key, null, POI_MISS_TTL_MS);
       return null;
     }
 
@@ -105,10 +164,11 @@ export async function searchOpenRicePoi(
       );
     }
     pick ??= results[0];
-    _poiCache.set(key, pick.poiId);
+    poiCacheSet(key, pick.poiId, POI_HIT_TTL_MS);
     return pick.poiId;
-  } catch {
-    _poiCache.set(key, null);
+  } catch (err) {
+    // Network/parse error — transient. DON'T cache; retry next search.
+    logOpenRice('warn', name, `search threw ${(err as Error)?.name ?? 'Error'} — not caching`);
     return null;
   }
 }
@@ -163,13 +223,21 @@ interface PickerResponse {
  *   - Slots exist, some within ±60 min of target time → those slots, available=true
  *   - Slots exist but all outside target window       → 5 earliest, flagged
  *                                                        nextAvailableTime: true
+ *   - OpenRice has nothing on the requested day and    → 5 earliest on the next
+ *     bumps `bookingDate` to a later day                 open day, flagged
+ *                                                        nextAvailableDate: true
  *
  * The caller (fetchAvailability) treats [] as "I couldn't help, try
- * the next source" — never as "definitely no booking exists."
+ * the next source" — never as "definitely no booking exists." Every
+ * fall-through is logged (via logOpenRice) so we can tell *why* a
+ * restaurant produced nothing instead of failing silently.
  */
 export async function fetchOpenRiceSlots(input: BookingInput): Promise<TimeSlot[]> {
   const poiId = await searchOpenRicePoi(input.restaurantName, input.districtHint);
-  if (poiId == null) return [];
+  if (poiId == null) {
+    logOpenRice('debug', input.restaurantName, 'no OpenRice poiId — falling through');
+    return [];
+  }
 
   const target = new Date(input.dateTime);
   // The API expects date + time in HK-local terms. Build them via
@@ -186,12 +254,12 @@ export async function fetchOpenRiceSlots(input: BookingInput): Promise<TimeSlot[
     minute: '2-digit',
     hour12: false,
   });
-  const bookingDate = dateFmt.format(target); // "YYYY-MM-DD"
+  const requestedDate = dateFmt.format(target); // "YYYY-MM-DD"
   const timeSlot = timeFmt.format(target).slice(0, 5); // "HH:MM"
 
   const url =
     `${BASE}/api/v2/booking/picker?poiId=${poiId}&countryCode=HK&seat=${input.partySize}` +
-    `&timeSlot=${encodeURIComponent(timeSlot)}&bookingDate=${bookingDate}` +
+    `&timeSlot=${encodeURIComponent(timeSlot)}&bookingDate=${requestedDate}` +
     `&uiLang=en&uiCity=hongkong`;
 
   let data: PickerResponse;
@@ -200,36 +268,85 @@ export async function fetchOpenRiceSlots(input: BookingInput): Promise<TimeSlot[
       headers: { Accept: 'application/json', 'User-Agent': UA },
     });
     // 404 means "not on OpenRice TMS." Anything else non-OK is a
-    // transient failure — also fall through.
-    if (!res.ok) return [];
+    // transient failure — also fall through (but say so in the log).
+    if (!res.ok) {
+      logOpenRice('warn', input.restaurantName, `picker HTTP ${res.status} — falling through`);
+      return [];
+    }
     data = (await res.json()) as PickerResponse;
-  } catch {
+  } catch (err) {
+    logOpenRice(
+      'warn',
+      input.restaurantName,
+      `picker request threw ${(err as Error)?.name ?? 'error'} — falling through`,
+    );
     return [];
   }
 
   // Some responses come back wrapped: {success: false, error: {httpCode: 404}}.
-  if (data.success === false) return [];
+  if (data.success === false) {
+    logOpenRice('debug', input.restaurantName, 'picker returned success:false — falling through');
+    return [];
+  }
   // Check both the top-level flags AND the nested bookingWidget flags.
   // The two layers can disagree — `isAvailable` at top level means
   // "this restaurant has booking", while `bookingWidget.isAvailable`
   // means "slots exist for the requested date". We want the slots-exist
   // signal; bail if either says no.
-  if (data.isBookingDisabled || data.bookingWidget?.isBookingDisabled) return [];
-  if (data.isAvailable === false || data.bookingWidget?.isAvailable === false) return [];
+  if (data.isBookingDisabled || data.bookingWidget?.isBookingDisabled) {
+    logOpenRice('debug', input.restaurantName, 'booking disabled — falling through');
+    return [];
+  }
+  if (data.isAvailable === false || data.bookingWidget?.isAvailable === false) {
+    logOpenRice('debug', input.restaurantName, 'isAvailable:false — falling through');
+    return [];
+  }
 
   const slots = data.bookingWidget?.timeSlots ?? [];
   const enabled = slots.filter((s) => !s.isDisabled);
-  if (enabled.length === 0) return [];
+  if (enabled.length === 0) {
+    logOpenRice('debug', input.restaurantName, 'no enabled slots — falling through');
+    return [];
+  }
 
-  const bookingUrl = buildBookingUrl(poiId, bookingDate, input.partySize, timeSlot);
+  // KEY FIX: OpenRice silently bumps `bookingDate` to the next day that
+  // actually has tables when the requested day is full/closed (e.g. ask
+  // for 1 Jun, it answers with slots for 2 Jun). The slots in the
+  // response belong to THAT returned day, not the day we asked for — so
+  // we must date them off the response, not off `requestedDate`, or
+  // every slot ends up timestamped on the wrong day.
+  const responseDate = data.bookingDate ?? requestedDate;
+  const sameDay = responseDate === requestedDate;
+  const bookingUrl = buildBookingUrl(poiId, responseDate, input.partySize, timeSlot);
 
-  // Convert each "HH:MM" into a full ISO datetime in HK time.
+  // Convert each "HH:MM" into a full ISO datetime in HK time, on the
+  // day the slots actually belong to.
   const targetMs = target.getTime();
   const windowMs = SLOT_WINDOW_MIN * 60_000;
   const slotsWithMs = enabled.map((s) => ({
     s,
-    ms: combineHkDateTime(bookingDate, s.timeSlot),
+    ms: combineHkDateTime(responseDate, s.timeSlot),
   }));
+
+  // OpenRice bumped us to a later day → nothing on the requested day.
+  // Surface the 5 earliest on the next open day, flagged so the UI
+  // shows amber "earliest open: <date>" rather than green.
+  if (!sameDay) {
+    logOpenRice(
+      'debug',
+      input.restaurantName,
+      `no tables on ${requestedDate}; earliest open ${responseDate}`,
+    );
+    return slotsWithMs
+      .sort((a, b) => a.ms - b.ms)
+      .slice(0, 5)
+      .map(({ ms }) => ({
+        time: new Date(ms).toISOString(),
+        available: true,
+        bookingUrl,
+        nextAvailableDate: true,
+      }));
+  }
 
   const inWindow = slotsWithMs.filter(({ ms }) => Math.abs(ms - targetMs) <= windowMs);
 
