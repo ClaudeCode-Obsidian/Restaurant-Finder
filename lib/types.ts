@@ -67,6 +67,10 @@ export interface Restaurant {
   userRatingsTotal: number;
   priceTier: PriceTier;
   priceLabel: string;    // human-readable from PRICE_LABELS
+  /** True when priceTier came from a real source (Places / Maps / OpenRice);
+   *  false when it's an estimate (Claude or cuisine default). Lets price
+   *  filtering keep "unconfirmed" places instead of dropping them. */
+  priceConfirmed?: boolean;
   address: string;
   neighborhood?: string; // e.g. "Central", "Tsim Sha Tsui"
   location: { lat: number; lng: number };

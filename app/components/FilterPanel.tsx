@@ -118,26 +118,24 @@ export interface FilterInitial {
  * results-page header can show what the user actually searched for.
  *
  * The submit() builder writes `q` as
- *   "[cuisine] restaurant [price] in [location], Hong Kong"
- * so we parse those pieces back out, and split the ISO dateTime into the
- * HK calendar day + HH:MM the Date/Time dropdowns expect.
+ *   "[cuisine] restaurant in [location], Hong Kong"
+ * (price now travels in its own `price` param), so we parse cuisine/location
+ * back out of `q`, take price from the param, and split the ISO dateTime into
+ * the HK calendar day + HH:MM the Date/Time dropdowns expect.
  */
 export function filtersFromSearch(
   q: string,
   dateTime: string,
   partySize: string,
+  price: string,
 ): { cuisine: string; initial: FilterInitial } {
   let cuisine = '';
   const cm = q.match(/^(.*?)\s*restaurant\b/i);
   if (cm && cm[1].trim()) cuisine = cm[1].trim();
 
-  let price = '';
-  for (const p of PRICES) {
-    if (p.value && q.includes(p.value)) {
-      price = p.value;
-      break;
-    }
-  }
+  // Price comes straight from its own param now; validate against the known
+  // bands so a stray value can't pre-select a non-existent option.
+  const validPrice = PRICES.some((p) => p.value === price) ? price : '';
 
   let location = '';
   const lm = q.match(/\bin (.+?),\s*Hong Kong/i);
@@ -163,7 +161,7 @@ export function filtersFromSearch(
     }
   }
 
-  return { cuisine, initial: { date, time, price, location, party: partySize || '2' } };
+  return { cuisine, initial: { date, time, price: validPrice, location, party: partySize || '2' } };
 }
 
 export function FilterPanel({
@@ -259,10 +257,12 @@ export function FilterPanel({
     if (submitting) return;
     setSubmitting(true);
 
+    // Note: price is NOT baked into `q`. Google's text search treats a price
+    // phrase as loose keywords, not a real filter, so it never enforced the
+    // band. We now pass price as its own param and filter by tier server-side.
     const parts: string[] = [];
     if (cuisine) parts.push(cuisine);
     parts.push('restaurant');
-    if (price) parts.push(price);
     if (location) parts.push(`in ${location}, Hong Kong`);
     else parts.push('Hong Kong');
 
@@ -270,6 +270,7 @@ export function FilterPanel({
       q: parts.join(' '),
       dateTime: combineDateTime(date, time),
       partySize: party,
+      price, // '' = Any price (server skips the filter)
     });
     router.push(`/search?${params.toString()}`);
     // On the results page the route doesn't remount, so clear the busy

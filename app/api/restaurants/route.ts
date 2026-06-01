@@ -41,6 +41,32 @@ import { PRICE_LABELS, type PriceTier, type Restaurant } from '@/lib/types';
 export const runtime = 'nodejs'; // need Node APIs for cheerio/scraping
 export const dynamic = 'force-dynamic'; // results vary per query — don't cache the route itself
 
+/**
+ * The FilterPanel price dropdown sends these exact band strings. Map each to
+ * its 1–6 PriceTier so we can filter results by price. Keep in sync with
+ * PRICES in app/components/FilterPanel.tsx.
+ */
+const PRICE_BAND_TIER: Record<string, number> = {
+  'under $50': 1,
+  '$51 to $100': 2,
+  '$101 to $200': 3,
+  '$201 to $400': 4,
+  '$401 to $800': 5,
+  'over $800': 6,
+};
+
+/**
+ * Keep a restaurant for a given price band. `requestedTier` 0 means "Any
+ * price" → keep everything. Otherwise:
+ *   - unconfirmed price (estimate) → keep (user opted to see these),
+ *   - confirmed price → keep only within one tier of the band.
+ */
+function inPriceBand(r: Restaurant, requestedTier: number): boolean {
+  if (!requestedTier) return true;
+  if (!r.priceConfirmed) return true;
+  return Math.abs(r.priceTier - requestedTier) <= 1;
+}
+
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
   const q = sp.get('q')?.trim();
@@ -48,6 +74,9 @@ export async function GET(req: NextRequest) {
 
   const dateTime = sp.get('dateTime') || new Date().toISOString();
   const partySize = parseInt(sp.get('partySize') ?? '2', 10);
+  // Structured price band the user picked (e.g. "$101 to $200"), mapped to a
+  // 1–6 tier. 0 = "Any price" → no price filtering at all.
+  const requestedTier = PRICE_BAND_TIER[sp.get('price') ?? ''] ?? 0;
 
   // 1. Get candidate restaurants from Google.
   //
@@ -58,7 +87,13 @@ export async function GET(req: NextRequest) {
   // around there for restaurants with non-trivial review counts.
   const RATING_THRESHOLD = 4.3;
   const MIN_REVIEWS = 30; // ignore the rating if barely anyone has rated it
-  const DISPLAY_LIMIT = 8;
+  // We want to surface ~8 restaurants with a bookable table NEAR the
+  // requested time. Many places won't have one (fully booked, or no online
+  // booking), so we enrich a deeper pool than 8 and let the client split the
+  // survivors into "available near your time" vs "not available at your time".
+  // Restaurants with no booking link, or none free near the time, are dropped
+  // below and never reach the client.
+  const MAX_ENRICH = 16;
 
   // The user's query (`q`) carries the target area in plain English
   // (e.g. "sushi in Causeway Bay") — Google's textQuery parser handles
@@ -85,7 +120,19 @@ export async function GET(req: NextRequest) {
   const rest = pool.filter(
     (p) => !((p.rating ?? 0) >= RATING_THRESHOLD && (p.userRatingsTotal ?? 0) >= MIN_REVIEWS),
   );
-  const places = [...highlyRated, ...rest].slice(0, DISPLAY_LIMIT);
+  // Pre-filter by price BEFORE paying the per-restaurant Playwright cost:
+  // drop places whose Google-confirmed price is clearly outside the band
+  // (more than one tier away — we allow one band either side per the user's
+  // setting). Places with no price yet (tier 0) are kept; their real tier is
+  // resolved during enrichment and re-checked there.
+  const ranked = [...highlyRated, ...rest];
+  const banded = requestedTier
+    ? ranked.filter((p) => {
+        const t = p.priceTier ?? 0;
+        return t === 0 || Math.abs(t - requestedTier) <= 1;
+      })
+    : ranked;
+  const places = banded.slice(0, MAX_ENRICH);
 
   // 2. Stream-enrich. Each restaurant's enrichment promise resolves
   //    independently; we emit its result on the wire the instant it
@@ -105,15 +152,27 @@ export async function GET(req: NextRequest) {
 
       await Promise.all(
         places.map(async (p) => {
+          let restaurant: Restaurant;
           try {
-            const restaurant = await enrichOne(p, dateTime, partySize);
-            send({ type: 'restaurant', restaurant });
+            restaurant = await enrichOne(p, dateTime, partySize);
           } catch (err) {
-            // Don't let one failure kill the whole stream — emit a
-            // degraded card so the slot doesn't silently disappear.
+            // Don't let one failure kill the whole stream — fall back to a
+            // degraded card (status 'check_failed') so a genuinely-bookable
+            // place isn't silently dropped just because our scrape threw.
             console.error('enrichment failed', p.placeId, err);
-            send({ type: 'restaurant', restaurant: degradedCard(p) });
+            restaurant = degradedCard(p);
           }
+          // Drop dead ends: no booking link at all, or a working booking
+          // system with nothing free near the requested time. Everything
+          // still actionable — bookable now, bookable at another time/date,
+          // or "link exists but we couldn't read it" — goes to the client,
+          // which decides which section to place it in.
+          if (isHiddenForResults(restaurant)) return;
+          // Drop restaurants whose CONFIRMED price falls outside the chosen
+          // band (±1 tier). Estimated/unconfirmed prices are kept — the user
+          // asked to see places we couldn't price with certainty.
+          if (!inPriceBand(restaurant, requestedTier)) return;
+          send({ type: 'restaurant', restaurant });
         }),
       );
 
@@ -177,18 +236,25 @@ async function enrichOne(
   const blurb = describe.description;
 
   // Price resolution — see route docstring for the priority order.
+  // `priceConfirmed` tracks whether the tier came from a real source
+  // (Places / Maps / OpenRice) vs an estimate (Claude / cuisine default).
   let priceTier: PriceTier =
     googlePlacesTier > 0 ? googlePlacesTier
     : mapsPriceTier > 0 ? mapsPriceTier
     : 0;
+  let priceConfirmed = priceTier > 0; // Places or Maps gave us a real figure
   if (priceTier === 0) {
     // Conditional: ~30% of restaurants reach this. OpenRice scrape is ~4–6s.
     priceTier = await fetchOpenRicePrice(name);
+    if (priceTier > 0) priceConfirmed = true; // OpenRice is a real source too
   }
-  if (priceTier === 0) priceTier = describe.estimatedPriceTier;
-  if (priceTier === 0) priceTier = defaultTierFromCuisine(p.cuisine, p.rating ?? 0);
+  if (priceTier === 0) priceTier = describe.estimatedPriceTier; // estimate
+  if (priceTier === 0) priceTier = defaultTierFromCuisine(p.cuisine, p.rating ?? 0); // estimate
   // Override: trust Places API's top-tier label over a capped Maps signal.
-  if (googlePlacesTier === 6 && priceTier < 6) priceTier = 6;
+  if (googlePlacesTier === 6 && priceTier < 6) {
+    priceTier = 6;
+    priceConfirmed = true;
+  }
   const priceLabel = PRICE_LABELS[priceTier];
 
   return {
@@ -199,6 +265,7 @@ async function enrichOne(
     userRatingsTotal: p.userRatingsTotal ?? 0,
     priceTier,
     priceLabel,
+    priceConfirmed,
     address: p.address ?? '',
     neighborhood: extractNeighborhood(p.address),
     location: p.location ?? { lat: 0, lng: 0 },
@@ -211,6 +278,22 @@ async function enrichOne(
     availability: availabilityResult.slots,
     availabilityStatus: availabilityResult.status,
   };
+}
+
+/**
+ * Results we never surface: a place with no booking link at all, or one we
+ * checked successfully that has no open table near the requested time. Both
+ * are dead ends for someone trying to book, so we omit them entirely.
+ *
+ * Anything with a bookable slot (green = near the time, or amber = another
+ * time/date) stays, as does 'check_failed' (a booking link we couldn't read
+ * — we don't want to hide a place that might actually be free).
+ */
+function isHiddenForResults(r: Restaurant): boolean {
+  const hasBookable = (r.availability ?? []).some((s) => s.available);
+  if (hasBookable) return false;
+  const status = r.availabilityStatus ?? 'no_slots';
+  return status === 'no_booking_link' || status === 'no_slots';
 }
 
 /**
@@ -228,6 +311,9 @@ function degradedCard(p: Partial<Restaurant>): Restaurant {
     userRatingsTotal: p.userRatingsTotal ?? 0,
     priceTier: tier,
     priceLabel: PRICE_LABELS[tier],
+    // Only Places gave us this tier; treat >0 as confirmed, 0 as unknown so
+    // price filtering keeps it rather than dropping a place we never priced.
+    priceConfirmed: tier > 0,
     address: p.address ?? '',
     neighborhood: extractNeighborhood(p.address),
     location: p.location ?? { lat: 0, lng: 0 },
