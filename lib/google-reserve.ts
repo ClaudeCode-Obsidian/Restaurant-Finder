@@ -158,10 +158,15 @@ export async function fetchReserveSlots(input: ReserveInput): Promise<ReserveRes
     // string lookup misses it and selectDate spuriously returns false.
     // Skipping is both correct (page is already on the right day) and
     // faster (~1–2 s saved on every "search for tonight" request).
+    // We call selectDate purely for its navigation side-effect (clicking
+    // the picker to the requested day). We no longer consume its return
+    // value: both slot labelling and the post-navigation wait now key off
+    // the slot timestamps and the requested day directly, which are immune
+    // to the picker's unreliable click-confirmation.
     const target = new Date(input.dateTime);
-    const dateMatched = isSameDayInHK(target, new Date())
-      ? true
-      : await selectDate(page, target);
+    if (!isSameDayInHK(target, new Date())) {
+      await selectDate(page, target);
+    }
     if (input.partySize !== 2) await selectPartySize(page, input.partySize);
     // ALWAYS set the time (not just when non-default) because Reserve's
     // default is "current clock time rounded up" — which has nothing to
@@ -193,10 +198,24 @@ export async function fetchReserveSlots(input: ReserveInput): Promise<ReserveRes
     // Restaurants with several seating areas (e.g. WAKARAN: Counter /
     // High-Top / Main Dining) re-render more slowly and hit this most.
     //
-    // So: drove to a specific day → wait for that day's slots. Otherwise
-    // (today fast-path) the simple "any slot" wait is correct.
-    const droveToOtherDay = dateMatched && !isSameDayInHK(target, new Date());
-    if (droveToOtherDay) {
+    // Future-day search → wait for a slot ON THAT DAY before reading.
+    // Today → the simple "any slot" wait is correct.
+    //
+    // CRITICAL: gate this on the requested day, NOT on `dateMatched`. The
+    // old code waited for the target day's slots only when the date click
+    // "looked" successful (dateMatched true). But that flag is unreliable —
+    // Reserve relabels days so the click verification often returns false
+    // even though the page IS loading the requested day. In that case the
+    // old code fell through to the "any slot" wait, which resolves
+    // instantly on the today-slots the page first paints, and we then read
+    // those stale slots before the list re-renders to the requested day —
+    // surfacing today's tables for a tomorrow search (all flagged "next
+    // available date"). Waiting for the target day's slots regardless of
+    // the flag defeats that race; if the day genuinely has no availability,
+    // the wait times out (swallowed) and parseSlotsFromHtml labels whatever
+    // remains correctly.
+    const targetIsToday = isSameDayInHK(target, new Date());
+    if (!targetIsToday) {
       await waitForSlotsOnDay(page, target).catch(() => undefined);
     } else {
       await page
@@ -205,7 +224,7 @@ export async function fetchReserveSlots(input: ReserveInput): Promise<ReserveRes
     }
 
     const html = await page.content();
-    const slots = parseSlotsFromHtml(html, input.dateTime, bookingUrl, dateMatched);
+    const slots = parseSlotsFromHtml(html, input.dateTime, bookingUrl);
     if (slots.length > 0) return { slots, status: 'ok' };
     // Empty result: if the widget hydrated, the restaurant genuinely has
     // no bookable times that day; if it never hydrated, our scrape failed.
@@ -801,22 +820,25 @@ function priceTierFromText(text: string | null): PriceTier {
  * to the user's requested day, the DOM updates client-side and the
  * `data-bts` attributes reflect that day's slot times.
  *
+ * We classify each slot by comparing its OWN embedded timestamp against the
+ * requested day and time — never against whether the date-picker click
+ * "looked" successful, which is an unreliable signal (Reserve relabels days).
+ *
  * Behaviour:
- *   - `dateMatched` true + slots within ±SLOT_WINDOW_MIN of target →
+ *   - slot on the requested day, within ±SLOT_WINDOW_MIN of target →
  *     confirmed slots (green pills).
- *   - `dateMatched` true + no slots near target time → same-day-other-time
+ *   - slot on the requested day but no time near target → same-day-other-time
  *     slots flagged `nextAvailableTime` (banner: "Other times on <date>").
  *     Happens often on Google Reserve because the page defaults to the
  *     restaurant's earliest service of the day (e.g. lunch) and doesn't
  *     accept a time parameter — so a dinner request lands on lunch slots.
- *   - `dateMatched` false → page is on a different date entirely; flag
- *     `nextAvailableDate` (banner: "Earliest open: <date>").
+ *   - no slot on the requested day at all → the page is on a different date
+ *     entirely; flag `nextAvailableDate` (banner: "Earliest open: <date>").
  */
 function parseSlotsFromHtml(
   html: string,
   isoTarget: string,
-  bookingUrl: string,
-  dateMatched: boolean
+  bookingUrl: string
 ): TimeSlot[] {
   const targetMs = new Date(isoTarget).getTime();
   const windowMs = SLOT_WINDOW_MIN * 60_000;
@@ -834,20 +856,21 @@ function parseSlotsFromHtml(
   if (allSlots.length === 0) return [];
 
   allSlots.sort((a, b) => a - b);
-  const inWindow = allSlots.filter((ms) => Math.abs(ms - targetMs) <= windowMs);
 
-  // CASE A — perfect match: right date AND slots near requested time.
-  if (dateMatched && inWindow.length > 0) {
-    return inWindow.slice(0, 5).map((ms) => ({
-      time: new Date(ms).toISOString(),
-      available: true,
-      bookingUrl,
-    }));
-  }
-
-  // No nearby slots. Distinguish "same date, wrong service" from
-  // "wrong date entirely" by comparing the slot calendar day to the
-  // requested calendar day in HK time.
+  // Decide green/amber from the SLOT TIMESTAMPS, not from whether the
+  // date-picker click "looked" successful (the old `dateMatched` flag).
+  //
+  // Why: that flag was a fragile proxy. Reserve frequently auto-sits on
+  // the requested day already (today's service is over, so it defaults to
+  // tomorrow) and renders it with a label format — "Jun 1", a weekday
+  // string — that our text matcher doesn't recognise. The click
+  // verification then returns false even though the slots on the page ARE
+  // the requested day. Every such restaurant got mislabelled "next
+  // available date" and dropped out of the "near your time" section.
+  //
+  // The slot's own embedded timestamp is the ground truth for which day it
+  // belongs to, so we compare against that directly. This is immune to
+  // whatever label format Reserve happens to use.
   const dayFmt = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Hong_Kong',
     year: 'numeric',
@@ -855,15 +878,40 @@ function parseSlotsFromHtml(
     day: '2-digit',
   });
   const targetDay = dayFmt.format(targetMs);
-  const slotDay = dayFmt.format(allSlots[0]);
-  const sameDay = dateMatched && targetDay === slotDay;
+  const onTargetDay = allSlots.filter((ms) => dayFmt.format(ms) === targetDay);
 
+  // CASE A — real slots ON the requested day, near the requested time → green.
+  const inWindow = onTargetDay.filter((ms) => Math.abs(ms - targetMs) <= windowMs);
+  if (inWindow.length > 0) {
+    return inWindow.slice(0, 5).map((ms) => ({
+      time: new Date(ms).toISOString(),
+      available: true,
+      bookingUrl,
+    }));
+  }
+
+  // CASE B — requested day IS loaded, but nothing near the requested time
+  // (e.g. only the lunch service is visible for a dinner request). Show the
+  // closest few times on that day, flagged "other times on <date>".
+  if (onTargetDay.length > 0) {
+    const nearest = [...onTargetDay]
+      .sort((a, b) => Math.abs(a - targetMs) - Math.abs(b - targetMs))
+      .slice(0, 5)
+      .sort((a, b) => a - b);
+    return nearest.map((ms) => ({
+      time: new Date(ms).toISOString(),
+      available: true,
+      bookingUrl,
+      nextAvailableTime: true,
+    }));
+  }
+
+  // CASE C — no slots on the requested day at all; surface the earliest
+  // other day Reserve is offering, flagged "earliest open: <date>".
   return allSlots.slice(0, 5).map((ms) => ({
     time: new Date(ms).toISOString(),
     available: true,
     bookingUrl,
-    // CASE B (sameDay=true): right date, wrong time of day.
-    // CASE C (sameDay=false): wrong date entirely.
-    ...(sameDay ? { nextAvailableTime: true } : { nextAvailableDate: true }),
+    nextAvailableDate: true,
   }));
 }
