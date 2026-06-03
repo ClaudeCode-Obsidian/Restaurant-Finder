@@ -6,33 +6,38 @@
  *
  * Concurrency is capped at MAX_CONCURRENT pages across the whole app —
  * not per module — so a single /api/restaurants request doesn't open
- * dozens of simultaneous browser pages and exhaust memory.
+ * dozens of simultaneous browser pages and exhaust memory. OpenRice's
+ * HTTP booking API now handles ~60-70% of availability lookups (see
+ * lib/openrice-booking.ts), so the Playwright path is only exercised for
+ * the long tail of restaurants OpenRice doesn't cover.
  *
- * Set to 4 (was 8) for two reasons:
- *   1. OpenRice's HTTP booking API now handles ~60-70% of availability
- *      lookups (see lib/openrice-booking.ts), so the Playwright path is
- *      only exercised for the long tail of restaurants OpenRice doesn't
- *      cover. Less parallelism is needed.
- *   2. At 8x parallel, the Google Reserve anchor was injecting too
- *      slowly on heavy pages (Pici Central, 10k+ reviews) — the 8 s
- *      timeout in google-reserve.ts was timing out under network/CPU
- *      contention. 4x gives each Maps page enough breathing room that
- *      Reserve injection comfortably completes within the bounded wait.
+ * See the comment on MAX_CONCURRENT below for the current value and the
+ * benchmark behind it.
  *
  * Each restaurant still does at most TWO sequential Playwright visits
- * (Maps place page → Reserve page), so peak concurrent pages stays at 4,
- * not 8.
+ * (Maps place page → Reserve page), so the pages a single restaurant
+ * holds at once is one, not two.
  */
 
 import { chromium, type Browser, type BrowserContext } from 'playwright';
 
-// Raised 4 → 6. With 8 restaurants per search and two sequential Playwright
-// visits each (Maps page → Reserve page), a cap of 4 meant up to half the
-// restaurants sat queued long enough that their Reserve check timed out and
-// fell back to the "couldn't confirm" placeholder. 6 lets more run in
-// parallel without overwhelming a typical dev machine; revisit if memory
-// pressure or Reserve-anchor injection slowness reappears under load.
-const MAX_CONCURRENT = 6;
+// Raised 6 → 12. A concurrency benchmark on the dev machine (Apple M1, 8
+// cores, 16 GB) ran 12 simultaneous Maps page-loads with ZERO failures and
+// only ~15% higher per-page latency vs 6 — the scrape is dominated by page
+// load + timeout waits (I/O-bound), not CPU, so the box isn't saturated at
+// 12. The win: a request's browser-bound tail (often ~10-13 restaurants
+// that miss OpenRice) now runs in roughly ONE wave instead of 2-3, cutting
+// heavy-query total time substantially.
+//
+// Watch-outs if this regresses:
+//   - The benchmark measured the timeout path (no Reserve anchor rendered).
+//     The success path does more CPU work; at 8x historically the Reserve
+//     anchor sometimes injected too slowly and timed out on heavy pages.
+//   - The M1 Air is fanless and throttles under SUSTAINED load — many
+//     concurrent user requests at 12-each could multiply total page count.
+// If Reserve timeouts or memory pressure reappear under real load, step
+// back toward 8.
+const MAX_CONCURRENT = 12;
 
 /* ─────────── Browser singleton ─────────── */
 
