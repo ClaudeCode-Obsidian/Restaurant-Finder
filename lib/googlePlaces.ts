@@ -60,6 +60,16 @@ const SEARCH_FIELDS = [
 export interface PlaceSearchInput {
   textQuery: string;       // e.g. "sushi restaurants in Central, Hong Kong"
   locationBias?: { lat: number; lng: number; radiusMeters?: number };
+  /**
+   * Hard geographic boundary (a rectangle: SW `low` → NE `high`). When set,
+   * results are RESTRICTED to this box — used to confine a search to the area
+   * the user picked. Takes precedence over `locationBias` (Places treats the
+   * two as mutually exclusive). Text Search only accepts a rectangle here.
+   */
+  locationRestriction?: {
+    low: { latitude: number; longitude: number };
+    high: { latitude: number; longitude: number };
+  };
   maxResults?: number;     // 1–20, defaults 20
   openNow?: boolean;
 }
@@ -142,12 +152,23 @@ export async function searchPlaces(input: PlaceSearchInput): Promise<Partial<Res
       includedType: 'restaurant',
     };
     if (input.openNow !== undefined) body.openNow = input.openNow;
-    body.locationBias = {
-      circle: {
-        center: { latitude: bias.lat, longitude: bias.lng },
-        radius: bias.radiusMeters ?? 5000,
-      },
-    };
+    // A hard area restriction (rectangle) wins over the soft HK-wide bias —
+    // Places treats the two as mutually exclusive, so we send only one.
+    if (input.locationRestriction) {
+      body.locationRestriction = {
+        rectangle: {
+          low: input.locationRestriction.low,
+          high: input.locationRestriction.high,
+        },
+      };
+    } else {
+      body.locationBias = {
+        circle: {
+          center: { latitude: bias.lat, longitude: bias.lng },
+          radius: bias.radiusMeters ?? 5000,
+        },
+      };
+    }
     if (pageToken) body.pageToken = pageToken;
 
     const res = await fetch(`${BASE}/places:searchText`, {

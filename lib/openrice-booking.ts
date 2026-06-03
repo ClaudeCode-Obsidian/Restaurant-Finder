@@ -30,7 +30,7 @@
  * [], which lets fetchAvailability fall through.
  */
 
-import type { TimeSlot } from './types';
+import type { PriceTier, TimeSlot } from './types';
 
 const BASE = 'https://www.openrice.com';
 const HK_TZ = 'Asia/Hong_Kong';
@@ -81,6 +81,15 @@ function logOpenRice(level: 'warn' | 'debug', restaurant: string, reason: string
  */
 interface PoiCacheEntry {
   poiId: number | null;
+  /**
+   * OpenRice's `priceRangeId` for this POI — the SAME 1–6 scale the app
+   * uses (1 = under $50 … 6 = over $801), or 0 when unknown. It rides
+   * along in the search response we already fetch, so caching it here
+   * lets the price-resolution step read it for free (no Google Maps
+   * Playwright scrape) for any OpenRice-covered restaurant. See
+   * getOpenRicePriceTier.
+   */
+  priceTier: number;
   expires: number;
 }
 const _poiCache = new Map<string, PoiCacheEntry>();
@@ -98,14 +107,36 @@ function poiCacheGet(key: string): number | null | undefined {
   return e.poiId;
 }
 
-function poiCacheSet(key: string, poiId: number | null, ttlMs: number): void {
-  _poiCache.set(key, { poiId, expires: Date.now() + ttlMs });
+function poiCacheSet(key: string, poiId: number | null, priceTier: number, ttlMs: number): void {
+  _poiCache.set(key, { poiId, priceTier, expires: Date.now() + ttlMs });
+}
+
+/**
+ * Cache-only lookup of the OpenRice price tier for a restaurant, using the
+ * SAME key as searchOpenRicePoi. Returns 0 (unknown) unless a *current*
+ * cache entry holds a valid 1–6 tier.
+ *
+ * This makes no network call by design: the availability lookup
+ * (fetchOpenRiceSlots → searchOpenRicePoi) runs first in the enrichment
+ * pipeline and primes this cache as a side effect, so by the time price
+ * resolution reads it, the value is already there for OpenRice-covered
+ * places. A miss here simply means "not on OpenRice / not looked up yet"
+ * and the caller falls through to its next price source.
+ */
+export function getOpenRicePriceTier(name: string, districtHint?: string): PriceTier {
+  const key = `${name.toLowerCase()}|${(districtHint ?? '').toLowerCase()}`;
+  const e = _poiCache.get(key);
+  if (!e || Date.now() > e.expires) return 0;
+  const t = e.priceTier;
+  return (t >= 1 && t <= 6 ? t : 0) as PriceTier;
 }
 
 interface SearchHit {
   poiId: number;
   name: string;
   district?: { name?: string };
+  /** OpenRice price band 1–6 (0/absent = unknown). Same scale as our PriceTier. */
+  priceRangeId?: number;
 }
 
 /**
@@ -152,7 +183,7 @@ export async function searchOpenRicePoi(
       // Genuine "no such restaurant on OpenRice" — safe to cache, but only
       // briefly so a transient empty response can still recover.
       logOpenRice('debug', name, 'search returned no results — cached as miss (10m)');
-      poiCacheSet(key, null, POI_MISS_TTL_MS);
+      poiCacheSet(key, null, 0, POI_MISS_TTL_MS);
       return null;
     }
 
@@ -164,7 +195,9 @@ export async function searchOpenRicePoi(
       );
     }
     pick ??= results[0];
-    poiCacheSet(key, pick.poiId, POI_HIT_TTL_MS);
+    // Cache the price band too — it's already in this response, and reading
+    // it here saves a separate Google Maps Playwright scrape downstream.
+    poiCacheSet(key, pick.poiId, pick.priceRangeId ?? 0, POI_HIT_TTL_MS);
     return pick.poiId;
   } catch (err) {
     // Network/parse error — transient. DON'T cache; retry next search.

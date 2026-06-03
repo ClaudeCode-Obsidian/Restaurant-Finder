@@ -48,6 +48,7 @@ function SearchPageInner() {
   const dateTime = sp.get('dateTime') ?? '';
   const partySize = sp.get('partySize') ?? '2';
   const price = sp.get('price') ?? '';
+  const area = sp.get('area') ?? '';
 
   // Reconstruct the dropdown selections from the current search URL so the
   // header's compact FilterPanel reflects what the user is looking at.
@@ -77,7 +78,7 @@ function SearchPageInner() {
 
     (async () => {
       try {
-        const params = new URLSearchParams({ q, dateTime, partySize, price });
+        const params = new URLSearchParams({ q, dateTime, partySize, price, area });
         const res = await fetch(`/api/restaurants?${params}`, {
           signal: ctl.signal,
         });
@@ -137,7 +138,7 @@ function SearchPageInner() {
       cancelled = true;
       ctl.abort();
     };
-  }, [q, dateTime, partySize, price]);
+  }, [q, dateTime, partySize, price, area]);
 
   // Split the streamed results into two sections:
   //   • near  — a bookable table close to the requested date & time. Shown

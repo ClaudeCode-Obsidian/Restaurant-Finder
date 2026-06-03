@@ -271,6 +271,12 @@ export function FilterPanel({
       dateTime: combineDateTime(date, time),
       partySize: party,
       price, // '' = Any price (server skips the filter)
+      // Pass the structured area so the server can confine the search to that
+      // area's geographic box (a hard filter). '' = Any area, and custom
+      // "Others…" areas simply won't match a known box server-side — both fall
+      // back to the HK-wide search. The text query still carries "in <area>"
+      // for relevance.
+      area: location,
     });
     router.push(`/search?${params.toString()}`);
     // On the results page the route doesn't remount, so clear the busy

@@ -22,18 +22,35 @@
  *   - Claude-generated description (also yields a backup price estimate)
  *   - Availability lookup
  *
- * Price resolution chain (priority order):
- *   1. Places API `priceLevel`  — instant, free, ~46% HK coverage
- *   2. Google Maps histogram    — Playwright but already-loaded; ~70% coverage
- *   3. OpenRice Playwright      — only when 1 + 2 both failed; ~5s extra
- *   4. Claude estimate          — bundled into the description call
- *   5. Cuisine-aware default    — last resort so we never show N/A
+ * Price resolution chain (priority order — what we DISPLAY):
+ *   1. OpenRice `priceRangeId`     — PREFERRED for display, and FREE: it
+ *                                    rides along in the availability JSON we
+ *                                    already fetched; ~60-70% HK coverage
+ *   2. Places API `priceLevel`     — instant fallback when not on OpenRice
+ *   3. Google Maps histogram       — Playwright; only when 1 + 2 both failed
+ *   4. OpenRice Playwright scrape  — only when 1–3 all failed; ~5s extra
+ *   5. Claude estimate             — bundled into the description call
+ *   6. Cuisine-aware default       — last resort so we never show N/A
+ *
+ * Why OpenRice first: its per-person band is HK-local and matches the
+ * figure diners see on the booking page, whereas Places' coarse 4-level
+ * `priceLevel` is a rougher signal. Ordering also helps SPEED — availability
+ * is resolved first, which primes the OpenRice price cache, so most
+ * restaurants get a confirmed price for free with no Google Maps scrape.
+ *
+ * Top-band exception: when the user filters for the "over $800" band,
+ * Google Places' priceLevel is used in preference to OpenRice (steps 1 and 2
+ * swap). OpenRice's scale tops out at a flat "Over $801" and can't separate
+ * genuinely ultra-premium fine dining (Google VERY_EXPENSIVE → 6) from
+ * regular fine dining (Google EXPENSIVE → 5); Places can. See enrichOne.
  */
 
 import { NextRequest, NextResponse } from 'next/server';
 import { searchPlaces } from '@/lib/googlePlaces';
+import { areaBox } from '@/lib/hk-areas';
 import { fetchGoogleMapsPrice } from '@/lib/google-reserve';
 import { fetchPriceTier as fetchOpenRicePrice } from '@/lib/openrice';
+import { getOpenRicePriceTier } from '@/lib/openrice-booking';
 import { fetchAvailability } from '@/lib/availability';
 import { describeRestaurant } from '@/lib/claude';
 import { PRICE_LABELS, type PriceTier, type Restaurant } from '@/lib/types';
@@ -67,6 +84,34 @@ function inPriceBand(r: Restaurant, requestedTier: number): boolean {
   return Math.abs(r.priceTier - requestedTier) <= 1;
 }
 
+/**
+ * Ranking-only score: a restaurant's star rating nudged up by a small bonus
+ * for review volume, so a well-reviewed 4.7★ place isn't out-ranked by a 5.0★
+ * place that only has a handful of ratings.
+ *
+ * IMPORTANT: this score is used ONLY to order the candidate pool. It is never
+ * stored or shown — every card still displays the real Google rating
+ * (p.rating). We deliberately don't mutate the rating itself.
+ *
+ * Bonus rule (per the product spec):
+ *   - 0 at or below 150 reviews.
+ *   - +0.02 for every COMPLETE 50 reviews above 150
+ *     (200 reviews → +0.02, 250 → +0.04, …, 650 → +0.20).
+ *   - total bonus capped at +0.20.
+ *   - boosted score capped at 5.0 so it can never exceed a perfect rating.
+ */
+const REVIEW_BONUS_BASELINE = 150; // bonus only accrues above this many reviews
+const REVIEW_BONUS_STEP = 50; // reviews per bonus increment
+const REVIEW_BONUS_PER_STEP = 0.02; // points added per increment
+const REVIEW_BONUS_CAP = 0.2; // maximum total bonus
+function rankingScore(p: Partial<Restaurant>): number {
+  const rating = p.rating ?? 0;
+  const reviews = p.userRatingsTotal ?? 0;
+  const steps = Math.floor((reviews - REVIEW_BONUS_BASELINE) / REVIEW_BONUS_STEP);
+  const bonus = steps > 0 ? Math.min(steps * REVIEW_BONUS_PER_STEP, REVIEW_BONUS_CAP) : 0;
+  return Math.min(rating + bonus, 5.0);
+}
+
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
   const q = sp.get('q')?.trim();
@@ -77,16 +122,18 @@ export async function GET(req: NextRequest) {
   // Structured price band the user picked (e.g. "$101 to $200"), mapped to a
   // 1–6 tier. 0 = "Any price" → no price filtering at all.
   const requestedTier = PRICE_BAND_TIER[sp.get('price') ?? ''] ?? 0;
+  // The area the user picked (e.g. "Central"). When it's one of our known HK
+  // areas we confine the Google Places search to that area's bounding box —
+  // a hard geographic filter, instead of relying on the soft "in <area>" text
+  // hint that let other districts leak in. Unknown/custom or "Any area" → no
+  // box → falls back to the HK-wide bias.
+  const box = areaBox(sp.get('area'));
 
   // 1. Get candidate restaurants from Google.
   //
-  // We fetch a wider pool (20) than we'll display (8) so we can favour
-  // highly-rated places before paying the per-restaurant Playwright cost.
-  // Anything ≥ 4.3 stars is treated as "highly rated" — Google's own
-  // research and OpenTable conventions both put the "great" threshold
-  // around there for restaurants with non-trivial review counts.
-  const RATING_THRESHOLD = 4.3;
-  const MIN_REVIEWS = 30; // ignore the rating if barely anyone has rated it
+  // We fetch a wide pool (60) than we'll display so we can rank the best
+  // places before paying the per-restaurant Playwright cost.
+  //
   // We want to surface ~8 restaurants with a bookable table NEAR the
   // requested time. Many places won't have one (fully booked, or no online
   // booking), so we enrich a deeper pool than 8 and let the client split the
@@ -100,32 +147,31 @@ export async function GET(req: NextRequest) {
   // location extraction natively, so we don't need a separate
   // locationBias unless we later add explicit map-based area picking.
   //
-  // 30 candidates requires 2 paged Places API calls (cap is 20/page).
-  // Still cheap (~1s total) and lets us cherry-pick the best 8 to
-  // enrich with Playwright.
+  // 60 candidates requires 3 paged Places API calls (cap is 20/page).
+  // Measured ~4.1s vs ~3.6s for 40 — the extra page adds only ~0.5s, and
+  // it only affects this upfront step (enrichment is still capped at
+  // MAX_ENRICH), so it buys a deeper ranking pool for negligible cost.
   const pool = await searchPlaces({
     textQuery: q,
-    maxResults: 30,
+    maxResults: 60,
+    locationRestriction: box ? { low: box.low, high: box.high } : undefined,
   });
 
-  // Stable partition: highly-rated first, everything else after, each
-  // group keeping Google's original relevance order. We deliberately
-  // don't sort *purely* by rating — Google's relevance signal already
-  // factors in distance, popularity, query match etc., and we don't want
-  // to surface a 4.9-star coffee stand above a 4.4-star sushi temple
-  // when the user searched "sushi".
-  const highlyRated = pool.filter(
-    (p) => (p.rating ?? 0) >= RATING_THRESHOLD && (p.userRatingsTotal ?? 0) >= MIN_REVIEWS,
-  );
-  const rest = pool.filter(
-    (p) => !((p.rating ?? 0) >= RATING_THRESHOLD && (p.userRatingsTotal ?? 0) >= MIN_REVIEWS),
-  );
+  // Rank by a review-volume-adjusted star score (see rankingScore): the real
+  // rating plus a small bonus for having lots of reviews, so a 4.7★ place with
+  // thousands of reviews isn't buried under a 5.0★ place with only a handful.
+  // Ties broken by raw review count. This score is for ORDERING ONLY — the
+  // rating shown to users is always the untouched Google value (p.rating).
+  const ranked = [...pool].sort((a, b) => {
+    const scoreDelta = rankingScore(b) - rankingScore(a);
+    if (scoreDelta !== 0) return scoreDelta;
+    return (b.userRatingsTotal ?? 0) - (a.userRatingsTotal ?? 0);
+  });
   // Pre-filter by price BEFORE paying the per-restaurant Playwright cost:
   // drop places whose Google-confirmed price is clearly outside the band
   // (more than one tier away — we allow one band either side per the user's
   // setting). Places with no price yet (tier 0) are kept; their real tier is
   // resolved during enrichment and re-checked there.
-  const ranked = [...highlyRated, ...rest];
   const banded = requestedTier
     ? ranked.filter((p) => {
         const t = p.priceTier ?? 0;
@@ -154,7 +200,7 @@ export async function GET(req: NextRequest) {
         places.map(async (p) => {
           let restaurant: Restaurant;
           try {
-            restaurant = await enrichOne(p, dateTime, partySize);
+            restaurant = await enrichOne(p, dateTime, partySize, requestedTier);
           } catch (err) {
             // Don't let one failure kill the whole stream — fall back to a
             // degraded card (status 'check_failed') so a genuinely-bookable
@@ -204,54 +250,110 @@ async function enrichOne(
   p: Partial<Restaurant>,
   dateTime: string,
   partySize: number,
+  requestedTier: number,
 ): Promise<Restaurant> {
   const name = p.name ?? 'Unknown';
   const googlePlacesTier = p.priceTier ?? 0;
-  // fetchGoogleMapsPrice + fetchAvailability *share* a Maps page visit
-  // via promise-cache in lib/google-reserve.ts — only one Playwright
-  // navigation happens per restaurant even though we kick off both here.
-  const [mapsPriceTier, describe, availabilityResult] = await Promise.all([
-    fetchGoogleMapsPrice(p.placeId!),
-    describeRestaurant({
-      name,
-      rating: p.rating ?? 0,
-      priceLabel: '', // not known yet; resolved below
-      cuisine: p.cuisine,
-      editorial: p.description,
-    }),
-    fetchAvailability({
-      placeId: p.placeId,
-      reservable: p.reservable,
-      bookingUrl: p.bookingUrl,
-      websiteUrl: p.websiteUrl,
-      dateTime,
-      partySize,
-      restaurantName: name,
-      // Neighborhood lets OpenRice disambiguate between branches of the
-      // same restaurant name (e.g. "Sole Mio" Central vs Causeway Bay).
-      neighborhood: extractNeighborhood(p.address),
-      location: p.location ?? { lat: 0, lng: 0 },
-    }),
-  ]);
-  const blurb = describe.description;
+  const neighborhood = extractNeighborhood(p.address);
 
-  // Price resolution — see route docstring for the priority order.
+  // Identify what booking/availability signal Google Places itself gave us,
+  // before we go out to OpenRice / Google Reserve. Places tells us *whether*
+  // a place takes reservations (`reservable`), but never returns real-time
+  // slots or a booking URL — so we log what's present and what isn't.
+  const placesSignal = identifyPlacesBookingSignal(name, p);
+
+  // The description (Claude) is independent of price/availability, so let
+  // it run in the background while we resolve those.
+  const describePromise = describeRestaurant({
+    name,
+    rating: p.rating ?? 0,
+    priceLabel: '', // not known yet; resolved below
+    cuisine: p.cuisine,
+    editorial: p.description,
+  });
+
+  // Resolve availability FIRST. For OpenRice-covered restaurants this is a
+  // ~200 ms JSON call that also primes the OpenRice price cache
+  // (priceRangeId) as a side effect — which the price step below reads for
+  // free, letting us skip the slow Google Maps scrape entirely.
+  const availabilityResult = await fetchAvailability({
+    placeId: p.placeId,
+    reservable: placesSignal.reservable,
+    bookingUrl: placesSignal.bookingLink,
+    websiteUrl: p.websiteUrl,
+    dateTime,
+    partySize,
+    restaurantName: name,
+    // Neighborhood lets OpenRice disambiguate between branches of the
+    // same restaurant name (e.g. "Sole Mio" Central vs Causeway Bay).
+    neighborhood,
+    location: p.location ?? { lat: 0, lng: 0 },
+  });
+
+  // Price resolution — see route docstring for the full chain.
   // `priceConfirmed` tracks whether the tier came from a real source
-  // (Places / Maps / OpenRice) vs an estimate (Claude / cuisine default).
-  let priceTier: PriceTier =
-    googlePlacesTier > 0 ? googlePlacesTier
-    : mapsPriceTier > 0 ? mapsPriceTier
-    : 0;
-  let priceConfirmed = priceTier > 0; // Places or Maps gave us a real figure
-  if (priceTier === 0) {
-    // Conditional: ~30% of restaurants reach this. OpenRice scrape is ~4–6s.
-    priceTier = await fetchOpenRicePrice(name);
-    if (priceTier > 0) priceConfirmed = true; // OpenRice is a real source too
+  // (OpenRice / Places / Maps) vs an estimate (Claude / cuisine default).
+  //
+  // By DEFAULT we display the OpenRice price in preference to Google Places:
+  // OpenRice's per-person band is HK-local and matches what diners actually
+  // see on the booking page, whereas Places' coarse 4-level `priceLevel` is a
+  // rougher signal.
+  //
+  // EXCEPTION — the top "over $800" band (requestedTier 6): OpenRice's scale
+  // tops out at a flat "Over $801", so it can't tell a genuinely ultra-premium
+  // room (Caprice, Joël Robuchon — Google's VERY_EXPENSIVE → tier 6) apart
+  // from a merely-pricey fine-dining spot (Google's EXPENSIVE → tier 5). When
+  // the user is specifically filtering for this band, Google Places' price is
+  // the better differentiator, so we prefer it here.
+  const topBandMode = requestedTier === 6;
+  let priceTier: PriceTier = 0;
+  let priceConfirmed = false;
+  let pricedByOpenRice = false;
+  const orTier = getOpenRicePriceTier(name, neighborhood);
+  if (topBandMode) {
+    // Top-band filter: Google Places first (differentiates 5 vs 6), then OpenRice.
+    if (googlePlacesTier > 0) {
+      priceTier = googlePlacesTier;
+      priceConfirmed = true;
+    } else if (orTier > 0) {
+      priceTier = orTier;
+      priceConfirmed = true;
+      pricedByOpenRice = true;
+    }
+  } else {
+    // Default: OpenRice first (HK-local, matches the booking page), then Places.
+    if (orTier > 0) {
+      priceTier = orTier;
+      priceConfirmed = true;
+      pricedByOpenRice = true;
+    } else if (googlePlacesTier > 0) {
+      priceTier = googlePlacesTier;
+      priceConfirmed = true;
+    }
   }
+  // Google Maps histogram — Playwright. Only when neither OpenRice nor Places
+  // priced it. For OpenRice misses that fell through to the Reserve scraper,
+  // the Maps page is already loaded, so this reuses that visit via the
+  // promise-cache in lib/google-reserve.ts.
+  if (priceTier === 0) {
+    const mapsTier = await fetchGoogleMapsPrice(p.placeId!);
+    if (mapsTier > 0) {
+      priceTier = mapsTier;
+      priceConfirmed = true;
+    }
+  }
+  if (priceTier === 0) {
+    // Conditional last-resort real source. OpenRice Playwright scrape ~4–6s.
+    priceTier = await fetchOpenRicePrice(name);
+    if (priceTier > 0) priceConfirmed = true;
+  }
+  const describe = await describePromise;
+  const blurb = describe.description;
   if (priceTier === 0) priceTier = describe.estimatedPriceTier; // estimate
   if (priceTier === 0) priceTier = defaultTierFromCuisine(p.cuisine, p.rating ?? 0); // estimate
-  // Override: trust Places API's top-tier label over a capped Maps signal.
-  if (googlePlacesTier === 6 && priceTier < 6) {
+  // Override: trust Places API's top-tier label over a capped Maps signal —
+  // but NOT over an OpenRice price, which we prefer to display.
+  if (!pricedByOpenRice && googlePlacesTier === 6 && priceTier < 6) {
     priceTier = 6;
     priceConfirmed = true;
   }
@@ -344,6 +446,37 @@ function defaultTierFromCuisine(cuisine: string | undefined, rating: number): Pr
   if (c) return rating >= 4.7 ? 4 : 3;
   // No cuisine info at all — pick the HK median
   return 3;
+}
+
+/**
+ * What Google Places (New) tells us about a restaurant's booking situation.
+ * Deliberately small: Places exposes only a `reservable` boolean. It does
+ * NOT return real-time availability (a slot list) or a dedicated booking
+ * URL, so those always come from OpenRice / Google Reserve downstream.
+ */
+interface PlacesBookingSignal {
+  /** Places' own flag: does this place take reservations? undefined = unknown. */
+  reservable?: boolean;
+  /** A usable booking link from Places — Places has no such field today, so
+   *  this is effectively always undefined; kept for forward compatibility. */
+  bookingLink?: string;
+}
+
+/**
+ * Inspect (and log) the booking/availability data Google Places returned for
+ * one restaurant, so we can see at a glance how much we're relying on the
+ * downstream OpenRice / Reserve lookups. Returns the signal so the caller can
+ * feed it into the availability stage.
+ */
+function identifyPlacesBookingSignal(name: string, p: Partial<Restaurant>): PlacesBookingSignal {
+  const reservable = p.reservable;
+  const bookingLink = p.bookingUrl; // Places (New) exposes no booking-URL field
+  const reservableStr = reservable === true ? 'yes' : reservable === false ? 'no' : 'unknown';
+  console.debug(
+    `[places] "${name}": reservable=${reservableStr}; realtime-slots=none; ` +
+      `booking-link=${bookingLink ? 'yes' : 'none'}`,
+  );
+  return { reservable, bookingLink };
 }
 
 /**
