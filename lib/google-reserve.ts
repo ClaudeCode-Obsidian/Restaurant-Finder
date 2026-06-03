@@ -832,8 +832,15 @@ function priceTierFromText(text: string | null): PriceTier {
  *     Happens often on Google Reserve because the page defaults to the
  *     restaurant's earliest service of the day (e.g. lunch) and doesn't
  *     accept a time parameter — so a dinner request lands on lunch slots.
- *   - no slot on the requested day at all → the page is on a different date
- *     entirely; flag `nextAvailableDate` (banner: "Earliest open: <date>").
+ *   - no slot on the requested day at all → return [] ("couldn't confirm").
+ *     We do NOT report another day's slots from Reserve. Reserve opens on
+ *     today and only shows a different day once the picker is driven there,
+ *     so "slots, but on the wrong day" almost always means the picker never
+ *     landed on the requested day — i.e. stale today's slots. We can't verify
+ *     they're the true soonest opening, so the Reserve path reports
+ *     availability ONLY for the user's selected day. Trustworthy
+ *     "earliest open: <date>" hints come from OpenRice (its API names the
+ *     exact date its slots are for); Reserve never invents one.
  */
 function parseSlotsFromHtml(
   html: string,
@@ -906,12 +913,26 @@ function parseSlotsFromHtml(
     }));
   }
 
-  // CASE C — no slots on the requested day at all; surface the earliest
-  // other day Reserve is offering, flagged "earliest open: <date>".
-  return allSlots.slice(0, 5).map((ms) => ({
-    time: new Date(ms).toISOString(),
-    available: true,
-    bookingUrl,
-    nextAvailableDate: true,
-  }));
+  // CASE C — there are slots on the page, but NONE on the requested day.
+  //
+  // HARD RULE: the Google Reserve path reports availability ONLY for the day
+  // the user selected. We do NOT surface another day's slots as a "next
+  // available date", and we explicitly do NOT trust them as the restaurant's
+  // true soonest opening.
+  //
+  // Why: Reserve always opens on TODAY and only shows a different day's slots
+  // once the date picker has been driven there. So when every slot we can read
+  // is on some OTHER day, it almost always means the picker did NOT land on
+  // the requested day (a flaky interaction) and we are looking at today's — or
+  // some default day's — stale slots. We have no reliable way to tell "picker
+  // reached the requested day and it's fully booked" apart from "picker never
+  // moved", so the only safe choice is to report nothing. Trusting these would
+  // let the app identify availability using a date the user never selected.
+  //
+  // Returning [] makes fetchReserveSlots report no requested-day availability;
+  // the caller then marks the restaurant "couldn't confirm" / omits it rather
+  // than advertising a date that isn't the one the user asked for. Reliable
+  // "earliest open: <date>" hints still come from OpenRice, whose API states
+  // the exact date its slots belong to (see fetchOpenRiceSlots).
+  return [];
 }
