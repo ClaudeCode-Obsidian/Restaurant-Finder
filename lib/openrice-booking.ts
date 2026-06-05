@@ -60,6 +60,87 @@ function logOpenRice(level: 'warn' | 'debug', restaurant: string, reason: string
   else console.debug(msg);
 }
 
+/* ─────────── Throttle + rate-limit-aware fetch ─────────── */
+
+/**
+ * OpenRice blocks bursty callers: when too many requests arrive at once it
+ * stops returning JSON and serves an HTML "slow down" page (HTTP 200, body
+ * starting with `<`). The old code called res.json() on that HTML, which threw
+ * a SyntaxError we mistook for "restaurant not found" — silently dropping real
+ * OpenRice coverage. This helper closes that hole with three guards:
+ *
+ *   1. THROTTLE — never more than OR_MAX_CONCURRENT OpenRice HTTP calls in
+ *      flight at once (process-wide), plus a little JITTER, so a wave of 16
+ *      enrichments doesn't hammer OpenRice in the same instant. This keeps us
+ *      under the rate limit so the block page rarely appears at all — the most
+ *      important guard.
+ *   2. DETECT — before parsing, confirm the body really is JSON (content-type
+ *      says json AND it doesn't start with `<`). An HTML block page is treated
+ *      as a transient rate-limit, never as "not found".
+ *   3. RETRY — on a block page / non-200 / network error, back off (a growing
+ *      delay) and retry up to OR_MAX_RETRIES times before giving up.
+ */
+const OR_MAX_CONCURRENT = 4; // max simultaneous OpenRice HTTP calls, process-wide
+const OR_MAX_RETRIES = 2; // extra attempts after the first (3 total)
+const OR_BACKOFF_BASE_MS = 500; // retry backoff base; grows per attempt (~0.5s, ~1s)
+const OR_JITTER_MS = 150; // small random spacing before each call
+
+let _orActive = 0;
+const _orWaiters: Array<() => void> = [];
+async function orAcquire(): Promise<void> {
+  if (_orActive < OR_MAX_CONCURRENT) {
+    _orActive++;
+    return;
+  }
+  await new Promise<void>((resolve) => _orWaiters.push(resolve));
+  _orActive++;
+}
+function orRelease(): void {
+  _orActive--;
+  _orWaiters.shift()?.();
+}
+const orSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const orJitter = (base: number) => base + Math.floor(Math.random() * base); // base..2×base
+
+/** Outcome of a throttled OpenRice GET: parsed JSON, or a transient block. */
+type OrResult<T> = { data: T } | { rateLimited: true };
+
+/**
+ * Throttled, block-page-aware OpenRice JSON GET. Returns `{ data }` on success,
+ * or `{ rateLimited: true }` when OpenRice blocked us / errored after all
+ * retries — which callers treat as "couldn't reach OpenRice this time; fall
+ * through and DON'T cache" (so it self-heals on the next search).
+ */
+async function openRiceJson<T>(url: string, restaurant: string): Promise<OrResult<T>> {
+  for (let attempt = 0; attempt <= OR_MAX_RETRIES; attempt++) {
+    if (attempt > 0) await orSleep(orJitter(OR_BACKOFF_BASE_MS) * attempt); // back off, growing
+    await orAcquire();
+    try {
+      await orSleep(orJitter(OR_JITTER_MS)); // small spacing under the throttle
+      const res = await fetch(url, {
+        headers: { Accept: 'application/json', 'User-Agent': UA },
+      });
+      const ct = res.headers.get('content-type') ?? '';
+      const body = await res.text();
+      // DETECT: a real JSON reply (not a 200 + HTML block page, not a non-200).
+      if (res.ok && ct.includes('json') && !body.trimStart().startsWith('<')) {
+        return { data: JSON.parse(body) as T };
+      }
+      const why = !res.ok ? `HTTP ${res.status}` : 'HTML block page (rate-limited)';
+      logOpenRice('warn', restaurant, `${why} — attempt ${attempt + 1}/${OR_MAX_RETRIES + 1}`);
+    } catch (err) {
+      logOpenRice(
+        'warn',
+        restaurant,
+        `fetch threw ${(err as Error)?.name ?? 'Error'} — attempt ${attempt + 1}/${OR_MAX_RETRIES + 1}`,
+      );
+    } finally {
+      orRelease();
+    }
+  }
+  return { rateLimited: true };
+}
+
 /* ─────────── POI ID resolution (with TTL cache) ─────────── */
 
 /**
@@ -159,51 +240,43 @@ export async function searchOpenRicePoi(
   const cached = poiCacheGet(key);
   if (cached !== undefined) return cached;
 
-  try {
-    const url =
-      `${BASE}/api/v2/search?uiLang=en&uiCity=hongkong&rows=5&what=` +
-      encodeURIComponent(name);
-    const res = await fetch(url, {
-      headers: { Accept: 'application/json', 'User-Agent': UA },
-    });
-    if (!res.ok) {
-      // Transient (rate-limit, 5xx, momentary block). DON'T cache — a bad
-      // moment shouldn't blacklist this name for the process lifetime.
-      logOpenRice('warn', name, `search HTTP ${res.status} — not caching (transient)`);
-      return null;
-    }
-    const data = (await res.json()) as {
-      paginationResult?: { results?: SearchHit[] };
-      searchedPoi?: SearchHit[];
-    };
-    // OpenRice's search response shape varies — sometimes
-    // `paginationResult.results`, sometimes `searchedPoi`.
-    const results = data.paginationResult?.results ?? data.searchedPoi ?? [];
-    if (results.length === 0) {
-      // Genuine "no such restaurant on OpenRice" — safe to cache, but only
-      // briefly so a transient empty response can still recover.
-      logOpenRice('debug', name, 'search returned no results — cached as miss (10m)');
-      poiCacheSet(key, null, 0, POI_MISS_TTL_MS);
-      return null;
-    }
-
-    let pick: SearchHit | undefined;
-    if (districtHint) {
-      const hint = districtHint.toLowerCase();
-      pick = results.find((r) =>
-        (r.district?.name ?? '').toLowerCase().includes(hint),
-      );
-    }
-    pick ??= results[0];
-    // Cache the price band too — it's already in this response, and reading
-    // it here saves a separate Google Maps Playwright scrape downstream.
-    poiCacheSet(key, pick.poiId, pick.priceRangeId ?? 0, POI_HIT_TTL_MS);
-    return pick.poiId;
-  } catch (err) {
-    // Network/parse error — transient. DON'T cache; retry next search.
-    logOpenRice('warn', name, `search threw ${(err as Error)?.name ?? 'Error'} — not caching`);
+  // rows=2: we only ever use the first match (or the district-hint match), so
+  // 2 keeps the response small while still allowing one branch disambiguation.
+  const url =
+    `${BASE}/api/v2/search?uiLang=en&uiCity=hongkong&rows=2&what=` +
+    encodeURIComponent(name);
+  const res = await openRiceJson<{
+    paginationResult?: { results?: SearchHit[] };
+    searchedPoi?: SearchHit[];
+  }>(url, name);
+  if ('rateLimited' in res) {
+    // Block page / non-200 / error after retries. DON'T cache — a bad moment
+    // shouldn't blacklist this name; it self-heals on the next search.
+    logOpenRice('warn', name, 'search unavailable (rate-limited/error) — not caching');
     return null;
   }
+  const data = res.data;
+  // OpenRice's search response shape varies — sometimes
+  // `paginationResult.results`, sometimes `searchedPoi`.
+  const results = data.paginationResult?.results ?? data.searchedPoi ?? [];
+  if (results.length === 0) {
+    // Genuine "no such restaurant on OpenRice" — safe to cache, but only
+    // briefly so a transient empty response can still recover.
+    logOpenRice('debug', name, 'search returned no results — cached as miss (10m)');
+    poiCacheSet(key, null, 0, POI_MISS_TTL_MS);
+    return null;
+  }
+
+  let pick: SearchHit | undefined;
+  if (districtHint) {
+    const hint = districtHint.toLowerCase();
+    pick = results.find((r) => (r.district?.name ?? '').toLowerCase().includes(hint));
+  }
+  pick ??= results[0];
+  // Cache the price band too — it's already in this response, and reading
+  // it here saves a separate Google Maps Playwright scrape downstream.
+  poiCacheSet(key, pick.poiId, pick.priceRangeId ?? 0, POI_HIT_TTL_MS);
+  return pick.poiId;
 }
 
 /* ─────────── Availability picker ─────────── */
@@ -295,26 +368,15 @@ export async function fetchOpenRiceSlots(input: BookingInput): Promise<TimeSlot[
     `&timeSlot=${encodeURIComponent(timeSlot)}&bookingDate=${requestedDate}` +
     `&uiLang=en&uiCity=hongkong`;
 
-  let data: PickerResponse;
-  try {
-    const res = await fetch(url, {
-      headers: { Accept: 'application/json', 'User-Agent': UA },
-    });
-    // 404 means "not on OpenRice TMS." Anything else non-OK is a
-    // transient failure — also fall through (but say so in the log).
-    if (!res.ok) {
-      logOpenRice('warn', input.restaurantName, `picker HTTP ${res.status} — falling through`);
-      return [];
-    }
-    data = (await res.json()) as PickerResponse;
-  } catch (err) {
-    logOpenRice(
-      'warn',
-      input.restaurantName,
-      `picker request threw ${(err as Error)?.name ?? 'error'} — falling through`,
-    );
+  // Throttled + block-page-aware (see openRiceJson). A rate-limit / error after
+  // retries falls through to the next availability source — never mistaken for
+  // "no booking".
+  const picker = await openRiceJson<PickerResponse>(url, input.restaurantName);
+  if ('rateLimited' in picker) {
+    logOpenRice('warn', input.restaurantName, 'picker unavailable (rate-limited/error) — falling through');
     return [];
   }
+  const data = picker.data;
 
   // Some responses come back wrapped: {success: false, error: {httpCode: 404}}.
   if (data.success === false) {
